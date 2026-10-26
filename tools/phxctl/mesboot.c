@@ -1650,10 +1650,10 @@ static int aux_xfer(uint8_t action, uint32_t addr, const uint8_t *wr_data, unsig
    else {
       const unsigned n = (st >> 24) & 0x1f;
       uint8_t buf[32] = {0};
-      for (unsigned i = 0; i < n && i < 32; i++) {
-         wr_abs(AUXR_SW_DATA, 0x80000001u | (i << 16));          // index i, read
-         buf[i] = (uint8_t)(rd_abs(AUXR_SW_DATA) >> 8);
-      }
+      // as dce_aux.c: index 0 and RW once, then sequential reads (the index moves on by itself); the first byte is the
+      // reply code. Setting the index before every read (round 40) returned the data shifted by one.
+      wr_abs(AUXR_SW_DATA, 0x80000001u);
+      for (unsigned i = 0; i < n && i < 32; i++) buf[i] = (uint8_t)(rd_abs(AUXR_SW_DATA) >> 8);
       ret = n ? buf[0] : -2;
       if (!write && rd) memcpy(rd, buf + 1, n > 1 ? (n - 1 < len ? n - 1 : len) : 0);
    }
@@ -1707,10 +1707,225 @@ static void dmub_state(const char *tag)
    printf("dmub %s: SCRATCH0 %08x INBOX1 base %08x size %u wptr %u rptr %u, region 4 at MC %llx\n", tag, rd_abs(DMCUB_SCRATCH0),
           rd_abs(DMCUB_IN1_BASE), rd_abs(DMCUB_IN1_SIZE), rd_abs(DMCUB_IN1_WPTR), rd_abs(DMCUB_IN1_RPTR), (unsigned long long)r4);
 }
+// ---- 60 <-> 120 Hz: Linux DC's own sequence on this 880M (trace of a GNOME mode switch, 2026-10-26; see
+// tools/linux-trace/dc_timeline.py), with what depends on the surface taken from the firmware's 3K@60 setup instead of
+// Linux's (its surface is tiled, ours linear):
+//   SMU (DCN mailbox): DISPCLK 800 MHz, DPPCLK 782, deep-sleep DCFCLK 55;
+//   blank: DPG black, backlight off (VBIOS LVTMA_CONTROL 2 + TRANSMITTER LCD_BLOFF), the DP stream off, OTG off, the
+//     DIG front end off, sink D3, TRANSMITTER DISABLE, panel power off (LVTMA 13 + TRANSMITTER POWER_OFF);
+//   timing: DP_DTO0_PHASE x2 (the firmware's modulo kept), HUBP DLG/TTU: the firmware's refclk-per-pixel fields x1/2,
+//     OTG back on;
+//   link: panel power on, ~180 ms, DIG back end on, TRANSMITTER ENABLE at symclk 810000 kHz, sink D0, then link training
+//     at LINK_RATE_SET 7 (8.1 Gb/s from the panel's rate table): TPS1, TPS4, the lane settings the panel asks for;
+//   stream: DIG FIFO, MSA, DP_VID_M for the new link rate, the stream on, backlight on, DPG off.
+// The firmware's 60 Hz values are saved once (/Users/Shared/gpu/hz60.base) and are what `hz 60` puts back.
+#define MP1_C2PMSG_67 0x16283u
+#define MP1_C2PMSG_83 0x16293u
+#define MP1_C2PMSG_91 0x1629bu
+static int dcn_smu(uint32_t msg, uint32_t param)
+{
+   double t0 = now_ms();
+   while (rd_abs(MP1_C2PMSG_91) == 0) if (now_ms() - t0 > 50) break;   // the previous one answered
+   wr_abs(MP1_C2PMSG_91, 0); wr_abs(MP1_C2PMSG_83, param); wr_abs(MP1_C2PMSG_67, msg);
+   uint32_t r = 0; t0 = now_ms();
+   while ((r = rd_abs(MP1_C2PMSG_91)) == 0) if (now_ms() - t0 > 200) break;
+   printf("hz: SMU msg %u (%u) -> %u, returns %u\n", msg, param, r, rd_abs(MP1_C2PMSG_83));
+   return r == 1 ? 0 : -1;
+}
+static int vb_lvtma(uint8_t action)
+{
+   uint8_t c[64] = {0x80, 0x0f, 0, 0, action};
+   const int r = dmub_send(c, 500);
+   if (r) printf("hz: DMCUB LVTMA_CONTROL %u not taken (%d)\n", action, r);
+   return r;
+}
+// VBIOS DIG1_TRANSMITTER_CONTROL as DC sends it (dig_transmitter_control_parameters_v1_7, the bytes of the trace)
+static int vb_tx(uint8_t action, uint8_t laneset, uint8_t lanes, uint32_t symclk_10khz, uint8_t conn, uint8_t last)
+{
+   uint8_t c[64] = {0x80, 0x01, 0x00, 0x3c, 0x00, action, laneset, lanes,
+                    (uint8_t)symclk_10khz, (uint8_t)(symclk_10khz >> 8), (uint8_t)(symclk_10khz >> 16), (uint8_t)(symclk_10khz >> 24),
+                    0x01, 0x00, conn, last};
+   const int r = dmub_send(c, 500);
+   if (r) printf("hz: DMCUB TRANSMITTER action %u not taken (%d)\n", action, r);
+   return r;
+}
+static const struct { uint32_t reg; const char *name; int refcyc; } kHzSaved[] = {
+   // DLG/TTU (DCN 3.5 pipe 0): REFCYC_* fields scale with the pixel time, DST_Y_* (lines) do not
+   {0x3b1c, "HUBPREQ0_REF_FREQ_TO_PIX_FREQ", 1}, {0x3b05, "HUBPREQ0_DST_DIMENSIONS", 1}, {0x3b12, "HUBPREQ0_NOM_PARAMETERS_1", 1},
+   {0x3b16, "HUBPREQ0_NOM_PARAMETERS_5", 1}, {0x3b0a, "HUBPREQ0_VBLANK_PARAMETERS_1", 1}, {0x3b0c, "HUBPREQ0_VBLANK_PARAMETERS_3", 1},
+   {0x3b1a, "HUBPREQ0_PER_LINE_DELIVERY", 2}, {0x3b19, "HUBPREQ0_PER_LINE_DELIVERY_PRE", 2}, {0x3b03, "HUBPREQ0_BLANK_OFFSET_0", 3},
+   {0x3b06, "HUBPREQ0_DST_AFTER_SCALER", 3}, {0x3ae9, "HUBPREQ0_DCN_TTU_QOS_WM", 2}, {0x3aea, "HUBPREQ0_DCN_GLOBAL_TTU_CNTL", 4},
+   {0x3aeb, "HUBPREQ0_DCN_SURF0_TTU_CNTL0", 5}, {0x3aec, "HUBPREQ0_DCN_SURF0_TTU_CNTL1", 1},
+   // the stream
+   {0x0141, "DP_DTO0_PHASE", 0}, {0x0142, "DP_DTO0_MODULO", 0}, {0x55e8, "DP0_DP_VID_M", 0}, {0x55e7, "DP0_DP_VID_N", 0},
+};
+#define HZ_NSAVED (sizeof(kHzSaved) / sizeof(kHzSaved[0]))
+// one register's value for `hz` Hz from its 60 Hz value: the refcyc fields divided by hz/60
+static uint32_t hz_scale(int kind, uint32_t v, int hz)
+{
+   const uint32_t k = (uint32_t)(hz / 60);
+   if (k <= 1) return v;
+   switch (kind) {
+   case 1: return (v & ~0x7fffffu) | ((v & 0x7fffffu) / k);                                          // one field [22:0]
+   case 2: return (((v >> 16) & 0x3fffu) / k) << 16 | ((v & 0x3fffu) / k) | (v & 0xc000c000u);      // two 14-bit fields
+   case 3: return (v & ~0x1fffu) | ((v & 0x1fffu) / k);                                              // low 13 bits refcyc
+   case 4: return (v & ~0xffffffu) | ((v & 0xffffffu) / k);                                          // MIN_TTU_VBLANK
+   case 5: return (v & ~0x7fffffu) | ((v & 0x7fffffu) / k);                                          // REFCYC_PER_REQ_DELIVERY
+   }
+   return v;
+}
+#define HZ_BASE "/Users/Shared/gpu/hz60.base"
+static int hz_base(uint32_t *base, int save)
+{
+   FILE *f = fopen(HZ_BASE, "r");
+   if (f) {
+      unsigned n = 0; char name[64]; unsigned a, v;
+      while (n < HZ_NSAVED && fscanf(f, "%x %63s %x", &a, name, &v) == 3) { if (a == kHzSaved[n].reg) base[n++] = v; else break; }
+      fclose(f);
+      if (n == HZ_NSAVED) return 1;
+   }
+   if (!save) return 0;
+   for (unsigned i = 0; i < HZ_NSAVED; i++) base[i] = rd_abs(kHzSaved[i].reg);
+   if (!(f = fopen(HZ_BASE, "w"))) return 0;
+   for (unsigned i = 0; i < HZ_NSAVED; i++) fprintf(f, "%05x %s %08x\n", kHzSaved[i].reg, kHzSaved[i].name, base[i]);
+   fclose(f);
+   printf("hz: the firmware's 60 Hz values saved in %s\n", HZ_BASE);
+   return 1;
+}
+// link training at LINK_RATE_SET idx (DP 1.4: TPS1 for clock recovery, TPS4 for equalization, lane settings as the
+// panel asks in ADJUST_REQUEST), the PHY's swing/pre-emphasis through VBIOS SETUP_VSEMPH. 0 = trained.
+static int hz_train(uint8_t idx, uint32_t symclk)
+{
+   uint8_t ls = 0, st[6] = {0}, b5[5];
+   wr_abs(0x55ee, 0); wr_abs(0x55de, 0); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);   // source TPS1
+   for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
+   if (dpcd_write(0x115, &idx, 1)) { printf("hz: LINK_RATE_SET not taken\n"); return -1; }
+   b5[0] = 0x21; memset(b5 + 1, ls, 4);
+   if (dpcd_write(0x102, b5, 5)) return -1;
+   int ok = 0;
+   for (int t = 0; t < 5 && !ok; t++) {                           // clock recovery
+      usleep(100);
+      if (dpcd_read(0x202, st, 6)) return -1;
+      printf("hz: CR %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], ls);
+      if ((st[0] & 0x11) == 0x11 && (st[1] & 0x11) == 0x11) { ok = 1; break; }
+      unsigned sw = 0, pe = 0;
+      for (int l = 0; l < 4; l++) { const unsigned a = (st[4 + l / 2] >> (4 * (l & 1))) & 0xf; if ((a & 3) > sw) sw = a & 3; if ((a >> 2) > pe) pe = a >> 2; }
+      ls = (uint8_t)(sw | (pe << 3) | (sw == 3 ? 4 : 0) | (pe == 3 ? 0x20 : 0));
+      for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
+      uint8_t l4[4]; memset(l4, ls, 4); dpcd_write(0x103, l4, 4);
+   }
+   if (!ok) { printf("hz: clock recovery failed\n"); return -1; }
+   wr_abs(0x55ee, 3); wr_abs(0x55de, 0); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);   // source TPS4
+   for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
+   b5[0] = 0x07; memset(b5 + 1, ls, 4);
+   if (dpcd_write(0x102, b5, 5)) return -1;
+   ok = 0;
+   for (int t = 0; t < 6 && !ok; t++) {                           // equalization
+      usleep(400);
+      if (dpcd_read(0x202, st, 6)) return -1;
+      printf("hz: EQ %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], ls);
+      if ((st[0] & 0x11) != 0x11 || (st[1] & 0x11) != 0x11) break;   // clock recovery lost
+      if (st[0] == 0x77 && st[1] == 0x77 && (st[2] & 1)) { ok = 1; break; }
+      unsigned sw = 0, pe = 0;
+      for (int l = 0; l < 4; l++) { const unsigned a = (st[4 + l / 2] >> (4 * (l & 1))) & 0xf; if ((a & 3) > sw) sw = a & 3; if ((a >> 2) > pe) pe = a >> 2; }
+      ls = (uint8_t)(sw | (pe << 3) | (sw == 3 ? 4 : 0) | (pe == 3 ? 0x20 : 0));
+      for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
+      uint8_t l4[4]; memset(l4, ls, 4); dpcd_write(0x103, l4, 4);
+   }
+   // end of training, as DC: the link's own framing and scrambling, the sink back to normal
+   wr_abs(0x55e5, 1); wr_abs(0x55e9, 0x10102000); wr_abs(0x55f4, 0x0101ff10); wr_abs(0x55de, 0x10); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);
+   const uint8_t z = 0; dpcd_write(0x102, &z, 1);
+   if (!ok) printf("hz: equalization failed\n");
+   return ok ? 0 : -1;
+}
+static int hz_otg_hz(void)   // the panel's refresh as OTG0's frame counter sees it over ~1 s, in mHz
+{
+   const uint32_t c0 = rd_abs(0x504d) & 0xffffff; const double t0 = now_ms();   // OTG0_OTG_STATUS_FRAME_COUNT
+   usleep(1000000);
+   const uint32_t c1 = rd_abs(0x504d) & 0xffffff; const double t1 = now_ms();
+   return (int)(((c1 - c0) & 0xffffff) * 1e6 / (t1 - t0));
+}
+static int hz_switch(int hz)
+{
+   uint32_t base[HZ_NSAVED];
+   uint8_t idx = 0, table[16];
+   if (hz != 60 && hz != 120) { fprintf(stderr, "hz 60|120\n"); return 2; }
+   if (dpcd_read(0x115, &idx, 1)) { printf("hz: STOP: the panel does not answer over AUX\n"); return 1; }
+   const int now_hz = idx == 7 ? 120 : idx == 5 ? 60 : 0;
+   printf("hz: the link runs at LINK_RATE_SET %u (%s), OTG %d mHz; going to %d Hz\n", idx, now_hz ? (now_hz == 60 ? "60 Hz" : "120 Hz") : "unknown",
+          hz_otg_hz(), hz);
+   if (!now_hz) { printf("hz: STOP: unknown link state\n"); return 1; }
+   if (now_hz == hz) { printf("hz: already there\n"); return 0; }
+   if (!hz_base(base, now_hz == 60)) { printf("hz: STOP: no 60 Hz values saved (%s) and the panel is not at 60 Hz\n", HZ_BASE); return 1; }
+   if (dpcd_read(0x10, table, 16)) { printf("hz: STOP: cannot read the link-rate table\n"); return 1; }
+   const uint8_t want = hz == 120 ? 7 : 5;
+   const unsigned rate = table[want * 2] | (table[want * 2 + 1] << 8);    // 200 kHz units
+   const uint32_t symclk = rate * 2;                                      // 10 kHz units: 40500 -> 81000 (810 MHz)
+   printf("hz: LINK_RATE_SET %u = %u.%02u Gb/s, symclk %u0 kHz\n", want, rate / 5000, (rate / 50) % 100, symclk);
+   if ((hz == 120 && rate != 40500) || (hz == 60 && rate != 21600)) { printf("hz: STOP: not the rate table of the 880M's panel\n"); return 1; }
+   const double t0 = now_ms();
+   const uint32_t dpg0 = rd_abs(0x4d14), vtg0 = rd_abs(0x39f7) | 0x80000000u;   // the firmware's DPG mode, VTG on
+   if (hz == 120) { dcn_smu(8, 55); dcn_smu(4, 800); dcn_smu(6, 782); }
+   // blank
+   wr_abs(0x4d14, 0x41);                                          // DPG: solid black
+   vb_lvtma(2); usleep(50000); vb_tx(0x02, 0, 4, 0, 0x14, 0xf4);  // backlight off
+   wr_abs(0x55e2, 0x00010200); wr_abs(0x55e3, 0x3f000001);        // DP stream off
+   wr_abs(0x5003, 0x00011200);                                    // OTG off, VTG with it
+   wr_abs(0x39f7, vtg0 & ~0x80000000u);
+   wr_abs(0x5044, 0x100); wr_abs(0x4f8f, 0x4);
+   wr_abs(0x5601, 0); wr_abs(0x555b, 0x1000011c); wr_abs(0x5555, 0); wr_abs(0x5554, 0xc00); wr_abs(0x555b, 0x1c);
+   wr_abs(0x557c, 0); wr_abs(0x160, 1); wr_abs(0x160, 0);         // DIG front end and back end off, symclk off
+   { const uint8_t d3 = 2; dpcd_write(0x600, &d3, 1); }
+   vb_tx(0x00, 0, 0, 0, 0x14, 0xf4); usleep(40000);               // TRANSMITTER DISABLE
+   wr_abs(0x55ee, 0); wr_abs(0x55de, 0); wr_abs(0x55e5, 0);
+   vb_lvtma(13); vb_tx(0x0d, 2, 4, 0, 0x14, 0xf6);                // panel power off
+   const double toff = now_ms();
+   // timing: pixel clock, DLG; OTG back on
+   wr_abs(0x4f8f, 0x3); wr_abs(0x5044, 0x3);
+   for (unsigned i = 0; i < HZ_NSAVED; i++) {
+      uint32_t v = base[i];
+      if (kHzSaved[i].reg == 0x0141) v = base[i] * (uint32_t)(hz / 60);                       // DP_DTO0_PHASE
+      else if (kHzSaved[i].reg == 0x55e8) v = (uint32_t)((uint64_t)base[i] * (hz / 60) * 21600 / rate + 0);  // VID_M for this link rate
+      else if (kHzSaved[i].refcyc) v = hz_scale(kHzSaved[i].refcyc, base[i], hz);
+      if (kHzSaved[i].reg != 0x55e8 && kHzSaved[i].reg != 0x55e7) wr_abs(kHzSaved[i].reg, v);
+   }
+   wr_abs(0x39f7, vtg0);
+   wr_abs(0x5003, 0x00001201);                                    // OTG on
+   wr_abs(0x5553, 0x100); wr_abs(0x557b, 0); wr_abs(0x557b, 0x10); wr_abs(0x5003, 0x00011201);
+   // link
+   while (now_ms() - toff < 500) usleep(10000);                   // the panel stays off 500 ms, as DC keeps it
+   vb_lvtma(12); vb_tx(0x0c, 2, 4, 0, 0x14, 0xf6);                // panel power on
+   usleep(180000);
+   wr_abs(0x557c, 0x100); wr_abs(0x5554, 0); wr_abs(0x53cd, 0); wr_abs(0x555b, 0x11c); wr_abs(0x5554, 0x10);
+   wr_abs(0x5555, 1); wr_abs(0x555b, 0x11e); wr_abs(0x555b, 0x10011c); wr_abs(0x555b, 0x11d);
+   wr_abs(0x55e1, 3); wr_abs(0x55f4, 0x0101ff10);
+   vb_tx(0x01, 0, 4, symclk, 0x00, 0xf4);                         // TRANSMITTER ENABLE at the new rate
+   { const uint8_t d0 = 1; dpcd_write(0x600, &d0, 1); usleep(1000); }
+   { const uint8_t one = 1, zero = 0, ss = 0x10, lc = 0x84; dpcd_write(0x10a, &one, 1); dpcd_write(0x102, &zero, 1);
+     dpcd_write(0x108, &one, 1); dpcd_write(0x107, &ss, 1); dpcd_write(0x101, &lc, 1); dpcd_write(0x100, &zero, 1); }
+   const int trained = hz_train(want, symclk);
+   // stream
+   uint32_t vidm = (uint32_t)((uint64_t)base[16] * (hz / 60) * 21600 / rate);   // M scales with pixel clock / link rate
+   wr_abs(0x557b, 0x810); wr_abs(0x160, 0x11); wr_abs(0x557c, 0x100); wr_abs(0x5554, 0xc10); wr_abs(0x53cd, 0);
+   wr_abs(0x555b, 0x11d); wr_abs(0x5554, 0xc10); wr_abs(0x5555, 1); wr_abs(0x555b, 0x11f); wr_abs(0x555b, 0x10011d); wr_abs(0x555b, 0x11d);
+   wr_abs(0x5601, 0); wr_abs(0x55df, 0x42000000);                 // no secondary data packets: the firmware sends none wr_abs(0x55e6, 0x400); wr_abs(0x55e7, base[17]); wr_abs(0x55e8, vidm);
+   wr_abs(0x55e6, 0x500); wr_abs(0x55e2, 0x00100200); wr_abs(0x55e3, 0x3f000001); wr_abs(0x55e3, 0x3f000000); wr_abs(0x55e2, 0x00100201);
+   wr_abs(0x555b, 0x11d); wr_abs(0x555b, 0x11f); wr_abs(0x555b, 0x10011d); wr_abs(0x555b, 0x11d);
+   vb_lvtma(3); vb_tx(0x03, 0, 4, 0, 0x14, 0xf4);                 // backlight on
+   wr_abs(0x4d14, dpg0 & ~1u);                                    // DPG off: the picture
+   usleep(100000);
+   uint8_t sst[3] = {0}; dpcd_read(0x202, sst, 3);
+   const uint32_t uf = (rd_abs(0x3ab3) >> 28) & 7;
+   printf("hz: done in %.0f ms: link %s (lanes %02x %02x align %02x), VID_M %08x, underflow %u, OTG now %d mHz\n", now_ms() - t0,
+          trained ? "NOT trained" : "trained", sst[0], sst[1], sst[2], vidm, uf, hz_otg_hz());
+   return trained ? 3 : 0;
+}
+
 // mesboot dpcd r <addr> <len> | dpcd w <addr> <hex bytes> | dmub <hex bytes of one command> | dmubstate
 static int link_cmd(int argc, char **argv)
 {
    if (!strcmp(argv[1], "dmubstate")) { dmub_state("now"); return 0; }
+   if (!strcmp(argv[1], "hz") && argc > 2) return hz_switch(atoi(argv[2]));
    if (!strcmp(argv[1], "dmub") && argc > 2) {
       uint8_t cmd[64] = {0};
       const int n = hexbytes(argv[2], cmd, 64);
@@ -1760,7 +1975,7 @@ int main(int argc, char **argv)
    if (open_kext()) return 1;
    if (argc < 2) { fprintf(stderr, "mesboot gart|mes|kiqsched|gpustat|claim|gfx|all ...\n"); return 2; }
    if (strcmp(argv[1], "gpustat") && strcmp(argv[1], "dump") && strcmp(argv[1], "claim") && strcmp(argv[1], "dcnflip") &&
-       strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") &&
+       strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") && strcmp(argv[1], "hz") &&
        accel_running() &&
        !(getenv("MESBOOT_FORCE") && *getenv("MESBOOT_FORCE") == '1')) {
       fprintf(stderr, "mesboot: STOP: the Metal accelerator (NMXAccel) already runs on the GPU, so this boot's bring-up "
@@ -1794,7 +2009,7 @@ int main(int argc, char **argv)
    if (!strcmp(argv[1], "dcnflip")) return dcnflip(argc > 2 ? atoi(argv[2]) : 4);
    if (!strcmp(argv[1], "sdmasys")) sdma_sys_test();
    if (!strcmp(argv[1], "sdmatest")) return sdmatest(argc > 2 ? atoi(argv[2]) : 10);
-   if (!strcmp(argv[1], "dpcd") || !strcmp(argv[1], "dmub") || !strcmp(argv[1], "dmubstate")) return link_cmd(argc, argv);
+   if (!strcmp(argv[1], "dpcd") || !strcmp(argv[1], "dmub") || !strcmp(argv[1], "dmubstate") || !strcmp(argv[1], "hz")) return link_cmd(argc, argv);
    if (!strcmp(argv[1], "kiqreg")) kiqreg_test();
    if (!strcmp(argv[1], "mec")) mec_test();
    if (!strcmp(argv[1], "sched")) sched_test();
