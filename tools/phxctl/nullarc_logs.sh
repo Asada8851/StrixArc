@@ -30,16 +30,22 @@ PRED='sender == "PhxBringup" OR sender == "PhxAccel" OR eventMessage CONTAINS "P
 SPAM='Unsupported sw composite destination'
 trim() { local t="$1.tmp"; grep -v -e 'cfg+0x' -e "$SPAM" > "$t"; if [ "$(wc -l < "$t")" -gt 30000 ]; then
          { head -15000 "$t"; echo "... ($(($(wc -l < "$t") - 30000)) lines left out) ..."; tail -15000 "$t"; } > "$1"; else mv "$t" "$1"; fi; rm -f "$t"; }
-q() { log show "$@" --style compact --info --predicate "$PRED" 2>&1; }
+# each log query gets 60 s at most (the log process itself is killed then): a full read of the unified log took minutes
+# and looked like a hang after a test's "done" (2026-10-27)
+limit() { "$@" & local p=$!; ( sleep 60; kill $p ) >/dev/null 2>&1 & local w=$!; wait $p 2>/dev/null; kill $w 2>/dev/null; }   # the watcher keeps no output open: "| tee" would wait for it
+q() { limit log show "$@" --style compact --info --predicate "$PRED"; }
+echo "== collecting logs for the USB stick (up to a minute)..."
 # the log queries are the slow part: run them side by side
-( q --last boot | trim "$D/boot.txt" ) &
+( q --last 2h > "$D/boot.txt.raw"; trim "$D/boot.txt" < "$D/boot.txt.raw"; rm -f "$D/boot.txt.raw" ) &
 P1=$!
 if [ -n "$BOOT" ]; then
-    ( q --start "$(date -r $((BOOT - 10800)) '+%Y-%m-%d %H:%M:%S')" --end "$(date -r "$BOOT" '+%Y-%m-%d %H:%M:%S')" | trim "$D/prevboot.txt" ) &
+    ( q --start "$(date -r $((BOOT - 10800)) '+%Y-%m-%d %H:%M:%S')" --end "$(date -r "$BOOT" '+%Y-%m-%d %H:%M:%S')" > "$D/prevboot.txt.raw"
+      trim "$D/prevboot.txt" < "$D/prevboot.txt.raw"; rm -f "$D/prevboot.txt.raw" ) &
     P2=$!
 fi
 if [ -n "${NULLARC_LOGS_SINCE:-}" ]; then
-    ( q --start "$NULLARC_LOGS_SINCE" --end "${NULLARC_LOGS_UNTIL:-$(date '+%Y-%m-%d %H:%M:%S')}" | trim "$D/window.txt" ) &
+    ( q --start "$NULLARC_LOGS_SINCE" --end "${NULLARC_LOGS_UNTIL:-$(date '+%Y-%m-%d %H:%M:%S')}" > "$D/window.txt.raw"
+      trim "$D/window.txt" < "$D/window.txt.raw"; rm -f "$D/window.txt.raw" ) &
     P3=$!
 fi
 {
@@ -56,7 +62,6 @@ fi
     echo "== processes"; pgrep -lx WindowServer; pgrep -fl 'mesboot|mtlprobe|fpsanim|phxboot' 2>/dev/null
     echo "== sysctl"; sysctl debug 2>/dev/null | grep -E 'phx|nvaccel'
     echo "== Metal allow list"; cat /Library/GPUBundles/nvmtl-allow.txt 2>&1 | head -12
-    echo "== '$SPAM' this boot: $(log show --last boot --style compact --predicate "eventMessage CONTAINS \"$SPAM\"" 2>/dev/null | grep -c "$SPAM")"
 } > "$D/state.txt" 2>&1
 tail -400 /var/log/phxboot.log > "$D/phxboot.log" 2>/dev/null
 # PhxBringup's IOLog lines do not reach the unified log on macOS 15 (none in boot.txt, 2026-10-26): the kernel's buffer

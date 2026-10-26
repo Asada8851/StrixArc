@@ -22,7 +22,7 @@ finish() { kill $KEEP 2>/dev/null; say "== done $(date '+%T')"
            bash "$LOGS" gpucopy "$LOG" ~/nullarc_fpsanim.out ~/nullarc_dmcub.bin | tee -a "$LOG"; }
 say "== $(date '+%F %T') $(sw_vers -productVersion) gpu_copy_test"
 sudo -v || exit 1
-( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) & KEEP=$!
+( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) >/dev/null 2>&1 & KEEP=$!
 trap finish EXIT
 B=$(ioreg -rc PhxBringup -d1 | sed -n 's/.*"phx-build" = \([0-9]*\).*/\1/p' | head -1)
 say "PhxBringup build ${B:-?}; scan-out copy: $(ioreg -rc PhxBringup -d1 | sed -n 's/.*"phx-scanout-copy" = "\(.*\)".*/\1/p' | head -1)"

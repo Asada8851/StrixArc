@@ -19,7 +19,7 @@ trap finish EXIT
 say "== $(date '+%F %T') $(sw_vers -productVersion) sdma_test"
 sudo -v || exit 1
 # keep sudo alive for the collector at the end (crash reports, panics)
-( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) & KEEP=$!
+( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) >/dev/null 2>&1 & KEEP=$!
 trap 'kill $KEEP 2>/dev/null; finish' EXIT
 
 B=$(ioreg -rc PhxBringup -d1 | sed -n 's/.*"phx-build" = \([0-9]*\).*/\1/p' | head -1)

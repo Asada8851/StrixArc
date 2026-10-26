@@ -12,7 +12,7 @@ G=/Users/Shared/gpu
 say() { echo "== $*"; }
 [ -e ~/Desktop/nullarc ] || { ln -s "$HERE" ~/Desktop/nullarc && say "link on the Desktop: ~/Desktop/nullarc"; }
 sudo -v || exit 1
-( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) & KEEP=$!
+( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) >/dev/null 2>&1 & KEEP=$!
 trap 'kill $KEEP 2>/dev/null' EXIT
 WANT=$(cat "$HERE/BUILD" 2>/dev/null || echo 0)
 REBOOT=""
@@ -45,7 +45,8 @@ if [ -n "$changed" ] || [ -n "$OFF" ]; then
     say "boot daemon:${changed:+ new$changed}${OFF:+ (kill switch was set: cleared)}; WindowServer on the GPU"
     sudo bash "$HERE/install_boot.sh" | tail -1 && sudo bash "$HERE/install_boot.sh" --windowserver --force | tail -1 ||
         { say "STOP: install_boot.sh failed"; exit 1; }
-    need_reboot "the boot daemon changed${OFF:+ (and the GPU was off: kill switch)}"
+    # the boot daemon's files only matter at the next boot: a reboot is needed now only when the GPU was off
+    [ -n "$OFF" ] && need_reboot "the kill switch was set (the GPU is off this boot)"
 else say "boot daemon is this folder's"; fi
 ioreg -rc NMXAccel -d0 | grep -q NMXAccel || need_reboot "the GPU is not up this boot (/var/log/phxboot.log: $(tail -1 /var/log/phxboot.log))"
 
