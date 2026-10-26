@@ -1607,6 +1607,143 @@ static int sdmatest(int frames)
    return tl >= 0 && !uf && !uf2 ? 0 : 5;
 }
 
+// ---- the eDP link: DPCD over AUX, and DMCUB's VBIOS command tables (the way to 120 Hz) -----------------------------
+// AUX channel 0 (the panel's), driven by registers the way Linux DC's dce_aux.c does on this 880M (trace of a 60 <-> 120
+// Hz switch, 2026-10-26): take the engine (ARB), write the request bytes into AUX_SW_DATA (action | addr[19:16],
+// addr[15:8], addr[7:0], len - 1, data), GO, poll AUX_SW_DONE, read the reply byte by byte (reply code first), give
+// the engine back. DMCUB runs under macOS (the GOP started it; INBOX1 holds its 56 commands) and executes VBIOS command
+// tables (type 128) the way DC uses it for the transmitter and the panel power.
+#define AUXR_SW_CONTROL 0x5411u
+#define AUXR_ARB        0x5412u
+#define AUXR_INT        0x5413u
+#define AUXR_SW_STATUS  0x5414u
+#define AUXR_SW_DATA    0x5416u
+#define DMCUB_R4_OFF    0x3656u
+#define DMCUB_R4_OFF_HI 0x3657u
+#define DMCUB_IN1_BASE  0x3694u
+#define DMCUB_IN1_SIZE  0x3695u
+#define DMCUB_IN1_WPTR  0x3696u
+#define DMCUB_IN1_RPTR  0x3697u
+#define DMCUB_SCRATCH0  0x36a3u
+static double now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
+// One AUX transaction. action 0x80 native write, 0x90 native read. Returns the reply code (0 ACK, 0x10 NACK, 0x20
+// DEFER) with the read bytes in rd, or -1 (engine not granted), -2 (no reply / timeout), -3 (receive error).
+static int aux_xfer(uint8_t action, uint32_t addr, const uint8_t *wr_data, unsigned len, uint8_t *rd)
+{
+   const int write = (action & 0x10) == 0;
+   wr_abs(AUXR_ARB, 1u << 16);                                   // AUX_SW_USE_AUX_REG_REQ
+   double t0 = now_ms();
+   while (((rd_abs(AUXR_ARB) >> 2) & 3) != 1) if (now_ms() - t0 > 20) { wr_abs(AUXR_ARB, 1u << 17); return -1; }
+   wr_abs(AUXR_INT, rd_abs(AUXR_INT) | 2u);                      // AUX_SW_DONE_ACK
+   const unsigned nreq = 4 + (write ? len : 0);
+   wr_abs(AUXR_SW_CONTROL, nreq << 16);                          // AUX_SW_WR_BYTES
+   const uint8_t hdr[4] = {(uint8_t)(action | ((addr >> 16) & 0xf)), (uint8_t)(addr >> 8), (uint8_t)addr, (uint8_t)(len - 1)};
+   for (unsigned i = 0; i < nreq; i++) {
+      const uint8_t b = i < 4 ? hdr[i] : wr_data[i - 4];
+      wr_abs(AUXR_SW_DATA, (i == 0 ? 0x80000000u : 0) | ((uint32_t)b << 8));   // index 0 first, then auto-increment
+   }
+   wr_abs(AUXR_SW_CONTROL, (nreq << 16) | 1u);                   // GO
+   uint32_t st = 0; t0 = now_ms();
+   while (!((st = rd_abs(AUXR_SW_STATUS)) & 1u)) if (now_ms() - t0 > 20) { wr_abs(AUXR_ARB, 1u << 17); return -2; }
+   int ret;
+   if (st & ((1u << 7) | (1u << 8) | (1u << 10) | (1u << 12) | (1u << 14) | (0xfu << 17) | (3u << 22))) ret = (st & (1u << 7)) ? -2 : -3;
+   else {
+      const unsigned n = (st >> 24) & 0x1f;
+      uint8_t buf[32] = {0};
+      for (unsigned i = 0; i < n && i < 32; i++) {
+         wr_abs(AUXR_SW_DATA, 0x80000001u | (i << 16));          // index i, read
+         buf[i] = (uint8_t)(rd_abs(AUXR_SW_DATA) >> 8);
+      }
+      ret = n ? buf[0] : -2;
+      if (!write && rd) memcpy(rd, buf + 1, n > 1 ? (n - 1 < len ? n - 1 : len) : 0);
+   }
+   wr_abs(AUXR_INT, rd_abs(AUXR_INT) | 2u);
+   wr_abs(AUXR_ARB, 1u << 17);                                   // AUX_SW_DONE_USING_AUX_REG
+   return ret;
+}
+// DPCD read/write with Linux's retries on DEFER (and on a lost reply). 0 = ACK.
+static int dpcd_read(uint32_t addr, uint8_t *buf, unsigned len)
+{
+   int r = -2;
+   for (int t = 0; t < 7; t++) { r = aux_xfer(0x90, addr, NULL, len, buf); if (r == 0 || r == 0x10) break; usleep(500); }
+   return r;
+}
+static int dpcd_write(uint32_t addr, const uint8_t *buf, unsigned len)
+{
+   int r = -2;
+   for (int t = 0; t < 7; t++) { r = aux_xfer(0x80, addr, buf, len, NULL); if (r == 0 || r == 0x10) break; usleep(500); }
+   return r;
+}
+// One 64-byte command into DMCUB's INBOX1 (region 4 in the carve-out, reached through the kext's window past the
+// BAR: PhxBringup 41+), WPTR moved on, waits until DMCUB's RPTR passes it. 0 = executed, -1 busy before, -2 not taken.
+static int dmub_send(const uint8_t cmd[64], double limit_ms)
+{
+   const uint32_t base = rd_abs(DMCUB_IN1_BASE), size = rd_abs(DMCUB_IN1_SIZE), wp = rd_abs(DMCUB_IN1_WPTR);
+   double t0 = now_ms();
+   while (rd_abs(DMCUB_IN1_RPTR) != wp) if (now_ms() - t0 > 100) return -1;
+   const uint64_t r4 = ((uint64_t)rd_abs(DMCUB_R4_OFF_HI) << 32) | rd_abs(DMCUB_R4_OFF);
+   const uint64_t off = (r4 - VRAM_MC) + (base - 0x80000000u) + wp;
+   for (unsigned i = 0; i < 64; i += 4) vw(off + i, (uint32_t)cmd[i] | (cmd[i + 1] << 8) | (cmd[i + 2] << 16) | ((uint32_t)cmd[i + 3] << 24));
+   const uint32_t nwp = (wp + 64) % size;
+   wr_abs(DMCUB_IN1_WPTR, nwp);
+   t0 = now_ms();
+   while (rd_abs(DMCUB_IN1_RPTR) != nwp) if (now_ms() - t0 > limit_ms) return -2;
+   return 0;
+}
+static int hexbytes(const char *s, uint8_t *out, unsigned max)
+{
+   unsigned n = 0;
+   while (*s && n < max) {
+      while (*s == ' ' || *s == ':') s++;
+      if (!s[0] || !s[1]) break;
+      unsigned v; if (sscanf(s, "%2x", &v) != 1) break;
+      out[n++] = (uint8_t)v; s += 2;
+   }
+   return (int)n;
+}
+static void dmub_state(const char *tag)
+{
+   const uint64_t r4 = ((uint64_t)rd_abs(DMCUB_R4_OFF_HI) << 32) | rd_abs(DMCUB_R4_OFF);
+   printf("dmub %s: SCRATCH0 %08x INBOX1 base %08x size %u wptr %u rptr %u, region 4 at MC %llx\n", tag, rd_abs(DMCUB_SCRATCH0),
+          rd_abs(DMCUB_IN1_BASE), rd_abs(DMCUB_IN1_SIZE), rd_abs(DMCUB_IN1_WPTR), rd_abs(DMCUB_IN1_RPTR), (unsigned long long)r4);
+}
+// mesboot dpcd r <addr> <len> | dpcd w <addr> <hex bytes> | dmub <hex bytes of one command> | dmubstate
+static int link_cmd(int argc, char **argv)
+{
+   if (!strcmp(argv[1], "dmubstate")) { dmub_state("now"); return 0; }
+   if (!strcmp(argv[1], "dmub") && argc > 2) {
+      uint8_t cmd[64] = {0};
+      const int n = hexbytes(argv[2], cmd, 64);
+      dmub_state("before");
+      const int r = n >= 4 ? dmub_send(cmd, 500) : -9;
+      printf("dmub: %d-byte command type %u sub %u -> %s\n", n, cmd[0], cmd[1], r == 0 ? "executed (RPTR passed it)" :
+             r == -1 ? "NOT sent: DMCUB busy with an earlier one" : r == -2 ? "NOT TAKEN within 500 ms" : "bad command");
+      dmub_state("after");
+      return r ? 1 : 0;
+   }
+   if (!strcmp(argv[1], "dpcd") && argc > 3) {
+      const uint32_t addr = (uint32_t)strtoul(argv[3], NULL, 0);
+      if (argv[2][0] == 'r') {
+         const unsigned len = argc > 4 ? (unsigned)strtoul(argv[4], NULL, 0) : 1;
+         uint8_t b[16] = {0};
+         if (len < 1 || len > 16) { fprintf(stderr, "len 1..16\n"); return 2; }
+         const int r = dpcd_read(addr, b, len);
+         printf("dpcd 0x%05x:", addr);
+         if (r == 0) { for (unsigned i = 0; i < len; i++) printf(" %02x", b[i]); printf("\n"); }
+         else printf(" %s (%d)\n", r == 0x10 ? "NACK" : r == 0x20 ? "DEFER" : "no reply", r);
+         return r ? 1 : 0;
+      }
+      if (argv[2][0] == 'w' && argc > 4) {
+         uint8_t b[16]; const int n = hexbytes(argv[4], b, 16);
+         const int r = n > 0 ? dpcd_write(addr, b, (unsigned)n) : -9;
+         printf("dpcd 0x%05x <- %d bytes: %s (%d)\n", addr, n, r == 0 ? "ACK" : r == 0x10 ? "NACK" : "failed", r);
+         return r ? 1 : 0;
+      }
+   }
+   fprintf(stderr, "mesboot dpcd r <addr> [len] | dpcd w <addr> <hex> | dmub <hex> | dmubstate\n");
+   return 2;
+}
+
 // NMXAccel starts only after `claim`, so once it runs, the bring-up of this boot is done (phxboot, or a test script).
 // A second gart/mes/queue setup under it rewrites the page tables, rings and MES state its clients are using: on a
 // boot with the phxboot LaunchDaemon, an old try script did exactly that and the next Metal client hung (2026-10-25).
@@ -1623,7 +1760,7 @@ int main(int argc, char **argv)
    if (open_kext()) return 1;
    if (argc < 2) { fprintf(stderr, "mesboot gart|mes|kiqsched|gpustat|claim|gfx|all ...\n"); return 2; }
    if (strcmp(argv[1], "gpustat") && strcmp(argv[1], "dump") && strcmp(argv[1], "claim") && strcmp(argv[1], "dcnflip") &&
-       strcmp(argv[1], "sdmatest") &&
+       strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") &&
        accel_running() &&
        !(getenv("MESBOOT_FORCE") && *getenv("MESBOOT_FORCE") == '1')) {
       fprintf(stderr, "mesboot: STOP: the Metal accelerator (NMXAccel) already runs on the GPU, so this boot's bring-up "
@@ -1657,6 +1794,7 @@ int main(int argc, char **argv)
    if (!strcmp(argv[1], "dcnflip")) return dcnflip(argc > 2 ? atoi(argv[2]) : 4);
    if (!strcmp(argv[1], "sdmasys")) sdma_sys_test();
    if (!strcmp(argv[1], "sdmatest")) return sdmatest(argc > 2 ? atoi(argv[2]) : 10);
+   if (!strcmp(argv[1], "dpcd") || !strcmp(argv[1], "dmub") || !strcmp(argv[1], "dmubstate")) return link_cmd(argc, argv);
    if (!strcmp(argv[1], "kiqreg")) kiqreg_test();
    if (!strcmp(argv[1], "mec")) mec_test();
    if (!strcmp(argv[1], "sched")) sched_test();
