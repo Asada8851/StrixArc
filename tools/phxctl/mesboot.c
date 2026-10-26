@@ -1686,20 +1686,50 @@ static int dpcd_write(uint32_t addr, const uint8_t *buf, unsigned len)
    for (int t = 0; t < 7; t++) { r = aux_xfer(0x80, addr, buf, len, NULL); if (r == 0 || r == 0x10) break; usleep(500); }
    return r;
 }
+// DMCUB's trace buffer (window 5: dmub_debugfs_trace_header, then 16-byte entries: code, tick, param0, param1). Every
+// command the firmware runs leaves 0x8b/0x8c (the ring pointers it saw), 0x21 (start: VBIOS sub-type, its first
+// parameter) ... 0x22 (end); what it did in between shows whether it acted on a command, and where it stopped.
+#define DMCUB_CW5_BASE   0x366au
+#define DMCUB_CW5_TOP    0x3672u
+#define DMCUB_CW5_OFF    0x367fu
+#define DMCUB_CW5_OFF_HI 0x3680u
+static uint32_t trace_seen = 0xffffffffu;
+static int dmub_dead, dmub_verbose;
+static void dmub_trace(const char *tag, unsigned max)
+{
+   const uint64_t t = (((uint64_t)rd_abs(DMCUB_CW5_OFF_HI) << 32) | rd_abs(DMCUB_CW5_OFF)) - VRAM_MC;
+   const uint32_t size = (rd_abs(DMCUB_CW5_TOP) & 0x7fffffffu) - rd_abs(DMCUB_CW5_BASE) + 1u;
+   const uint32_t n = vr(t), cap = size > 32 && size <= (16u << 20) ? (size - 16) / 16 : 0;
+   if (!cap) { printf("  trace %s: no trace buffer (window 5: %08x..%08x)\n", tag, rd_abs(DMCUB_CW5_BASE), rd_abs(DMCUB_CW5_TOP)); return; }
+   if (trace_seen == 0xffffffffu || n < trace_seen) trace_seen = n > max ? n - max : 0;
+   if (n - trace_seen > max) { printf("  trace %s: %u new entries, the last %u:\n", tag, n - trace_seen, max); trace_seen = n - max; }
+   else printf("  trace %s: %u new entries (%u in all)\n", tag, n - trace_seen, n);
+   for (uint32_t i = trace_seen; i < n; i++) {
+      const uint64_t e = t + 16 + 16ull * (i % cap);
+      printf("    %04x %08x %08x %08x\n", vr(e), vr(e + 4), vr(e + 8), vr(e + 12));
+   }
+   trace_seen = n;
+}
 // One 64-byte command into DMCUB's INBOX1 (region 4 in the carve-out, reached through the kext's window past the
-// BAR: PhxBringup 41+), WPTR moved on, waits until DMCUB's RPTR passes it. 0 = executed, -1 busy before, -2 not taken.
+// BAR: PhxBringup 41+), WPTR moved on, waits until DMCUB's RPTR passes it. 0 = executed, -1 busy before, -2 not taken,
+// -3 not sent: an earlier command was not taken (round 42: once DMCUB stops, everything after it queues up unseen).
 static int dmub_send(const uint8_t cmd[64], double limit_ms)
 {
+   if (dmub_dead) return -3;
    const uint32_t base = rd_abs(DMCUB_IN1_BASE), size = rd_abs(DMCUB_IN1_SIZE), wp = rd_abs(DMCUB_IN1_WPTR);
    double t0 = now_ms();
-   while (rd_abs(DMCUB_IN1_RPTR) != wp) if (now_ms() - t0 > 100) return -1;
+   if (dmub_verbose && trace_seen == 0xffffffffu) dmub_trace("before", 0);
+   while (rd_abs(DMCUB_IN1_RPTR) != wp) if (now_ms() - t0 > 100) { dmub_dead = 1; dmub_trace("DMCUB busy", 24); return -1; }
    const uint64_t r4 = ((uint64_t)rd_abs(DMCUB_R4_OFF_HI) << 32) | rd_abs(DMCUB_R4_OFF);
    const uint64_t off = (r4 - VRAM_MC) + (base - 0x80000000u) + wp;
    for (unsigned i = 0; i < 64; i += 4) vw(off + i, (uint32_t)cmd[i] | (cmd[i + 1] << 8) | (cmd[i + 2] << 16) | ((uint32_t)cmd[i + 3] << 24));
    const uint32_t nwp = (wp + 64) % size;
    wr_abs(DMCUB_IN1_WPTR, nwp);
    t0 = now_ms();
-   while (rd_abs(DMCUB_IN1_RPTR) != nwp) if (now_ms() - t0 > limit_ms) return -2;
+   while (rd_abs(DMCUB_IN1_RPTR) != nwp) if (now_ms() - t0 > limit_ms) { dmub_dead = 1; dmub_trace("NOT TAKEN", 32); return -2; }
+   const double dt = now_ms() - t0;
+   if (dmub_verbose) { printf("  dmub t%u s%u %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x: %.1f ms\n", cmd[0], cmd[1], cmd[4], cmd[5], cmd[6], cmd[7],
+                              cmd[8], cmd[9], cmd[10], cmd[11], cmd[12], cmd[13], cmd[14], cmd[15], dt); dmub_trace("", 40); }
    return 0;
 }
 static int hexbytes(const char *s, uint8_t *out, unsigned max)
@@ -1804,51 +1834,76 @@ static int hz_base(uint32_t *base, int save)
    printf("hz: the firmware's 60 Hz values saved in %s\n", HZ_BASE);
    return 1;
 }
+// The lane setting the panel asks for in ADJUST_REQUEST (the highest of the 4 lanes), capped at swing 2 / pre-emphasis 2
+// (round 42: swing 3 at HBR3 stopped DMCUB for good). *dpcd gets the same with MAX_*_REACHED where the cap is hit, for
+// TRAINING_LANEx_SET; the PHY gets it without the flags (Linux sent 00 and 08 only).
+static uint8_t hz_laneset(const uint8_t *st, uint8_t *dpcd)
+{
+   unsigned sw = 0, pe = 0;
+   for (int l = 0; l < 4; l++) { const unsigned a = (st[4 + l / 2] >> (4 * (l & 1))) & 0xf; if ((a & 3) > sw) sw = a & 3; if ((a >> 2) > pe) pe = a >> 2; }
+   if (sw > 2) sw = 2;
+   if (pe > 2) pe = 2;
+   if (sw + pe > 3) pe = 3 - sw;
+   *dpcd = (uint8_t)(sw | (pe << 3) | (sw == 2 ? 4 : 0) | (pe == 2 || sw + pe == 3 ? 0x20 : 0));
+   return (uint8_t)(sw | (pe << 3));
+}
+static int hz_vsemph(uint8_t ls, uint32_t symclk)   // SETUP_VSEMPH x4, as DC sends it
+{
+   for (int i = 0; i < 4; i++) if (vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6)) return -1;
+   return 0;
+}
 // link training at LINK_RATE_SET idx (DP 1.4: TPS1 for clock recovery, TPS4 for equalization, lane settings as the
-// panel asks in ADJUST_REQUEST), the PHY's swing/pre-emphasis through VBIOS SETUP_VSEMPH. 0 = trained.
+// panel asks in ADJUST_REQUEST), the PHY's swing/pre-emphasis through VBIOS SETUP_VSEMPH. 0 = trained, -1 failed,
+// -2 clock recovery found no lane at all (nothing the panel can lock to at this rate), -3 DMCUB stopped.
 static int hz_train(uint8_t idx, uint32_t symclk)
 {
-   uint8_t ls = 0, st[6] = {0}, b5[5];
+   uint8_t ls = 0, dls = 0, st[6] = {0}, b5[5];
    wr_abs(0x55ee, 0); wr_abs(0x55de, 0); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);   // source TPS1
-   for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
+   if (hz_vsemph(ls, symclk)) return -3;
    if (dpcd_write(0x115, &idx, 1)) { printf("hz: LINK_RATE_SET not taken\n"); return -1; }
-   b5[0] = 0x21; memset(b5 + 1, ls, 4);
+   b5[0] = 0x21; memset(b5 + 1, dls, 4);
    if (dpcd_write(0x102, b5, 5)) return -1;
-   int ok = 0;
+   int ok = 0, none = 0;
    for (int t = 0; t < 5 && !ok; t++) {                           // clock recovery
       usleep(100);
       if (dpcd_read(0x202, st, 6)) return -1;
-      printf("hz: CR %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], ls);
+      printf("hz: CR %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], dls);
       if ((st[0] & 0x11) == 0x11 && (st[1] & 0x11) == 0x11) { ok = 1; break; }
-      unsigned sw = 0, pe = 0;
-      for (int l = 0; l < 4; l++) { const unsigned a = (st[4 + l / 2] >> (4 * (l & 1))) & 0xf; if ((a & 3) > sw) sw = a & 3; if ((a >> 2) > pe) pe = a >> 2; }
-      ls = (uint8_t)(sw | (pe << 3) | (sw == 3 ? 4 : 0) | (pe == 3 ? 0x20 : 0));
-      for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
-      uint8_t l4[4]; memset(l4, ls, 4); dpcd_write(0x103, l4, 4);
+      none = !(st[0] & 0x11) && !(st[1] & 0x11);
+      const uint8_t pls = ls;
+      ls = hz_laneset(st, &dls);
+      if (ls == pls && t) break;                                   // asks for what it has: no point going on
+      if (hz_vsemph(ls, symclk)) return -3;
+      uint8_t l4[4]; memset(l4, dls, 4); dpcd_write(0x103, l4, 4);
    }
-   if (!ok) { printf("hz: clock recovery failed\n"); return -1; }
+   if (!ok) { printf("hz: clock recovery failed%s\n", none ? " on every lane" : ""); return none ? -2 : -1; }
    wr_abs(0x55ee, 3); wr_abs(0x55de, 0); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);   // source TPS4
-   for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
-   b5[0] = 0x07; memset(b5 + 1, ls, 4);
+   if (hz_vsemph(ls, symclk)) return -3;
+   b5[0] = 0x07; memset(b5 + 1, dls, 4);
    if (dpcd_write(0x102, b5, 5)) return -1;
    ok = 0;
    for (int t = 0; t < 6 && !ok; t++) {                           // equalization
       usleep(400);
       if (dpcd_read(0x202, st, 6)) return -1;
-      printf("hz: EQ %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], ls);
+      printf("hz: EQ %d: lanes %02x %02x align %02x adjust %02x %02x (laneset %02x)\n", t, st[0], st[1], st[2], st[4], st[5], dls);
       if ((st[0] & 0x11) != 0x11 || (st[1] & 0x11) != 0x11) break;   // clock recovery lost
       if (st[0] == 0x77 && st[1] == 0x77 && (st[2] & 1)) { ok = 1; break; }
-      unsigned sw = 0, pe = 0;
-      for (int l = 0; l < 4; l++) { const unsigned a = (st[4 + l / 2] >> (4 * (l & 1))) & 0xf; if ((a & 3) > sw) sw = a & 3; if ((a >> 2) > pe) pe = a >> 2; }
-      ls = (uint8_t)(sw | (pe << 3) | (sw == 3 ? 4 : 0) | (pe == 3 ? 0x20 : 0));
-      for (int i = 0; i < 4; i++) vb_tx(0x0b, ls, 4, symclk, 0x14, 0xf6);
-      uint8_t l4[4]; memset(l4, ls, 4); dpcd_write(0x103, l4, 4);
+      ls = hz_laneset(st, &dls);
+      if (hz_vsemph(ls, symclk)) return -3;
+      uint8_t l4[4]; memset(l4, dls, 4); dpcd_write(0x103, l4, 4);
    }
    // end of training, as DC: the link's own framing and scrambling, the sink back to normal
    wr_abs(0x55e5, 1); wr_abs(0x55e9, 0x10102000); wr_abs(0x55f4, 0x0101ff10); wr_abs(0x55de, 0x10); wr_abs(0x55ed, 0); wr_abs(0x55f3, 0x7fffff00);
    const uint8_t z = 0; dpcd_write(0x102, &z, 1);
    if (!ok) printf("hz: equalization failed\n");
    return ok ? 0 : -1;
+}
+static void hz_sink(const char *when)   // what the panel's receiver sees: lane status, alignment
+{
+   uint8_t st[6] = {0}, pw = 0;
+   const int r = dpcd_read(0x202, st, 6); dpcd_read(0x600, &pw, 1);
+   if (r) printf("hz: sink %s: no AUX reply (%d)\n", when, r);
+   else printf("hz: sink %s: lanes %02x %02x align %02x adjust %02x %02x, power %02x\n", when, st[0], st[1], st[2], st[4], st[5], pw);
 }
 static int hz_otg_hz(void)   // the panel's refresh as OTG0's frame counter sees it over ~1 s, in mHz
 {
@@ -1857,7 +1912,7 @@ static int hz_otg_hz(void)   // the panel's refresh as OTG0's frame counter sees
    const uint32_t c1 = rd_abs(0x500d) & 0xffffff; const double t1 = now_ms();
    return (int)(((c1 - c0) & 0xffffff) * 1e6 / (t1 - t0));
 }
-static int hz_switch(int hz)
+static int hz_switch(int hz, int force)
 {
    uint32_t base[HZ_NSAVED];
    uint8_t idx = 0, table[16];
@@ -1867,7 +1922,10 @@ static int hz_switch(int hz)
    printf("hz: the link runs at LINK_RATE_SET %u (%s), OTG %d mHz; going to %d Hz\n", idx, now_hz ? (now_hz == 60 ? "60 Hz" : "120 Hz") : "unknown",
           hz_otg_hz(), hz);
    if (!now_hz) { printf("hz: STOP: unknown link state\n"); return 1; }
-   if (now_hz == hz) { printf("hz: already there\n"); return 0; }
+   if (now_hz == hz && !force) { printf("hz: already there\n"); return 0; }
+   if (now_hz == hz) printf("hz: the same rate again: the whole power-off / link training cycle, nothing else changes\n");
+   dmub_verbose = 1;
+   hz_sink("before");
    if (!hz_base(base, now_hz == 60)) { printf("hz: STOP: no 60 Hz values saved (%s) and the panel is not at 60 Hz\n", HZ_BASE); return 1; }
    if (dpcd_read(0x10, table, 16)) { printf("hz: STOP: cannot read the link-rate table\n"); return 1; }
    const uint8_t want = hz == 120 ? 7 : 5;
@@ -1881,6 +1939,7 @@ static int hz_switch(int hz)
    // blank
    wr_abs(0x4d14, 0x41);                                          // DPG: solid black
    vb_lvtma(2); usleep(50000); vb_tx(0x02, 0, 4, 0, 0x14, 0xf4);  // backlight off
+   if (dmub_dead) { wr_abs(0x4d14, dpg0); printf("hz: STOP: DMCUB does not take commands; nothing else was changed\n"); return 4; }
    wr_abs(0x55e2, 0x00010200); wr_abs(0x55e3, 0x3f000001);        // DP stream off
    wr_abs(0x5003, 0x00011200);                                    // OTG off, VTG with it
    wr_abs(0x39f7, vtg0 & ~0x80000000u);
@@ -1889,6 +1948,7 @@ static int hz_switch(int hz)
    wr_abs(0x557c, 0); wr_abs(0x160, 1); wr_abs(0x160, 0);         // DIG front end and back end off, symclk off
    { const uint8_t d3 = 2; dpcd_write(0x600, &d3, 1); }
    vb_tx(0x00, 0, 0, 0, 0x14, 0xf4); usleep(40000);               // TRANSMITTER DISABLE
+   hz_sink("after TRANSMITTER DISABLE (the PHY off: no lane locked)");
    wr_abs(0x55ee, 0); wr_abs(0x55de, 0); wr_abs(0x55e5, 0);
    vb_lvtma(13); vb_tx(0x0d, 2, 4, 0, 0x14, 0xf6);                // panel power off
    const double toff = now_ms();
@@ -1913,14 +1973,28 @@ static int hz_switch(int hz)
    wr_abs(0x55e1, 3); wr_abs(0x55f4, 0x0101ff10);
    vb_tx(0x01, 0, 4, symclk, 0x00, 0xf4);                         // TRANSMITTER ENABLE at the new rate
    { const uint8_t d0 = 1; dpcd_write(0x600, &d0, 1); usleep(1000); }
+   hz_sink("after TRANSMITTER ENABLE, sink D0");
    { const uint8_t one = 1, zero = 0, ss = 0x10, lc = 0x84; dpcd_write(0x10a, &one, 1); dpcd_write(0x102, &zero, 1);
      dpcd_write(0x108, &one, 1); dpcd_write(0x107, &ss, 1); dpcd_write(0x101, &lc, 1); dpcd_write(0x100, &zero, 1); }
-   const int trained = hz_train(want, symclk);
+   int trained = dmub_dead ? -3 : hz_train(want, symclk);
+   if (trained == -2 && want != idx) {
+      // No lane locked at the new rate: is the PHY still at the old one? The panel back to the old rate, TPS1 still sent.
+      uint8_t st[3] = {0};
+      dpcd_write(0x115, &idx, 1); usleep(2000); dpcd_read(0x202, st, 3);
+      const int old = (st[0] & 0x11) == 0x11 && (st[1] & 0x11) == 0x11;
+      printf("hz: probe: the panel at LINK_RATE_SET %u again locks %s (lanes %02x %02x)%s\n", idx, old ? "at once" : "no lane either", st[0], st[1],
+             old ? ": the PHY never left the old rate - TRANSMITTER ENABLE did not set the new one" : "");
+      dpcd_write(0x115, &want, 1);
+      if (old) trained = -4;
+      wr_abs(0x55e5, 1); wr_abs(0x55e9, 0x10102000); wr_abs(0x55f4, 0x0101ff10); wr_abs(0x55de, 0x10);
+      const uint8_t z = 0; dpcd_write(0x102, &z, 1);
+   }
    // stream
    uint32_t vidm = (uint32_t)((uint64_t)base[16] * (hz / 60) * 21600 / rate);   // M scales with pixel clock / link rate
    wr_abs(0x557b, 0x810); wr_abs(0x160, 0x11); wr_abs(0x557c, 0x100); wr_abs(0x5554, 0xc10); wr_abs(0x53cd, 0);
    wr_abs(0x555b, 0x11d); wr_abs(0x5554, 0xc10); wr_abs(0x5555, 1); wr_abs(0x555b, 0x11f); wr_abs(0x555b, 0x10011d); wr_abs(0x555b, 0x11d);
-   wr_abs(0x5601, 0); wr_abs(0x55df, 0x42000000);                 // no secondary data packets: the firmware sends none wr_abs(0x55e6, 0x400); wr_abs(0x55e7, base[17]); wr_abs(0x55e8, vidm);
+   wr_abs(0x5601, 0); wr_abs(0x55df, 0x42000000);                 // no secondary data packets: the firmware sends none
+   wr_abs(0x55e6, 0x400); wr_abs(0x55e7, base[17]); wr_abs(0x55e8, vidm);
    wr_abs(0x55e6, 0x500); wr_abs(0x55e2, 0x00100200); wr_abs(0x55e3, 0x3f000001); wr_abs(0x55e3, 0x3f000000); wr_abs(0x55e2, 0x00100201);
    wr_abs(0x555b, 0x11d); wr_abs(0x555b, 0x11f); wr_abs(0x555b, 0x10011d); wr_abs(0x555b, 0x11d);
    vb_lvtma(3); vb_tx(0x03, 0, 4, 0, 0x14, 0xf4);                 // backlight on
@@ -1929,19 +2003,24 @@ static int hz_switch(int hz)
    uint8_t sst[3] = {0}; dpcd_read(0x202, sst, 3);
    const uint32_t uf = (rd_abs(0x3ab3) >> 28) & 7;
    printf("hz: done in %.0f ms: link %s (lanes %02x %02x align %02x), VID_M %08x, underflow %u, OTG now %d mHz\n", now_ms() - t0,
-          trained ? "NOT trained" : "trained", sst[0], sst[1], sst[2], vidm, uf, hz_otg_hz());
-   return trained ? 3 : 0;
+          trained == 0 ? "trained" : trained == -3 ? "NOT trained: DMCUB stopped taking commands" : trained == -4 ? "NOT trained: the PHY stayed at the old rate" : "NOT trained",
+          sst[0], sst[1], sst[2], vidm, uf, hz_otg_hz());
+   dmub_trace("at the end", 16);
+   return trained == 0 ? 0 : trained == -3 ? 4 : trained == -4 ? 5 : 3;
 }
 
-// mesboot dpcd r <addr> <len> | dpcd w <addr> <hex bytes> | dmub <hex bytes of one command> | dmubstate
+// mesboot dpcd r <addr> <len> | dpcd w <addr> <hex bytes> | dmub <hex bytes of one command> | dmubstate | dmubtrace [n]
+// | hz 60|120 [again]
 static int link_cmd(int argc, char **argv)
 {
    if (!strcmp(argv[1], "dmubstate")) { dmub_state("now"); return 0; }
-   if (!strcmp(argv[1], "hz") && argc > 2) return hz_switch(atoi(argv[2]));
+   if (!strcmp(argv[1], "hz") && argc > 2) return hz_switch(atoi(argv[2]), argc > 3 && !strcmp(argv[3], "again"));
+   if (!strcmp(argv[1], "dmubtrace")) { dmub_state("now"); dmub_trace("last", argc > 2 ? (unsigned)atoi(argv[2]) : 48); return 0; }
    if (!strcmp(argv[1], "dmub") && argc > 2) {
       uint8_t cmd[64] = {0};
       const int n = hexbytes(argv[2], cmd, 64);
       dmub_state("before");
+      dmub_verbose = 1;
       const int r = n >= 4 ? dmub_send(cmd, 500) : -9;
       printf("dmub: %d-byte command type %u sub %u -> %s\n", n, cmd[0], cmd[1], r == 0 ? "executed (RPTR passed it)" :
              r == -1 ? "NOT sent: DMCUB busy with an earlier one" : r == -2 ? "NOT TAKEN within 500 ms" : "bad command");
@@ -1967,7 +2046,7 @@ static int link_cmd(int argc, char **argv)
          return r ? 1 : 0;
       }
    }
-   fprintf(stderr, "mesboot dpcd r <addr> [len] | dpcd w <addr> <hex> | dmub <hex> | dmubstate\n");
+   fprintf(stderr, "mesboot dpcd r <addr> [len] | dpcd w <addr> <hex> | dmub <hex> | dmubstate | dmubtrace [n] | hz 60|120 [again]\n");
    return 2;
 }
 
@@ -1987,7 +2066,7 @@ int main(int argc, char **argv)
    if (open_kext()) return 1;
    if (argc < 2) { fprintf(stderr, "mesboot gart|mes|kiqsched|gpustat|claim|gfx|all ...\n"); return 2; }
    if (strcmp(argv[1], "gpustat") && strcmp(argv[1], "dump") && strcmp(argv[1], "claim") && strcmp(argv[1], "dcnflip") &&
-       strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") && strcmp(argv[1], "hz") &&
+       strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") && strcmp(argv[1], "dmubtrace") && strcmp(argv[1], "hz") &&
        accel_running() &&
        !(getenv("MESBOOT_FORCE") && *getenv("MESBOOT_FORCE") == '1')) {
       fprintf(stderr, "mesboot: STOP: the Metal accelerator (NMXAccel) already runs on the GPU, so this boot's bring-up "
@@ -2021,7 +2100,7 @@ int main(int argc, char **argv)
    if (!strcmp(argv[1], "dcnflip")) return dcnflip(argc > 2 ? atoi(argv[2]) : 4);
    if (!strcmp(argv[1], "sdmasys")) sdma_sys_test();
    if (!strcmp(argv[1], "sdmatest")) return sdmatest(argc > 2 ? atoi(argv[2]) : 10);
-   if (!strcmp(argv[1], "dpcd") || !strcmp(argv[1], "dmub") || !strcmp(argv[1], "dmubstate") || !strcmp(argv[1], "hz")) return link_cmd(argc, argv);
+   if (!strcmp(argv[1], "dpcd") || !strcmp(argv[1], "dmub") || !strcmp(argv[1], "dmubstate") || !strcmp(argv[1], "dmubtrace") || !strcmp(argv[1], "hz")) return link_cmd(argc, argv);
    if (!strcmp(argv[1], "kiqreg")) kiqreg_test();
    if (!strcmp(argv[1], "mec")) mec_test();
    if (!strcmp(argv[1], "sched")) sched_test();
