@@ -48,7 +48,7 @@ static void phxRunAtexit() {
 __attribute__((used, section("__DATA,__mod_term_func,mod_term_funcs"))) static void (*const gPhxTerm)() = phxRunAtexit;
 }
 
-#define PHX_KEXT_BUILD 40u
+#define PHX_KEXT_BUILD 41u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -282,6 +282,13 @@ private:
         uint64_t len, lastUse;
     };
     IOLock *blitLock{nullptr};
+    // Debug window past the BAR (build 41): the BAR shows the first 256 MiB of the 4 GiB carve-out under macOS, and
+    // DMCUB's inbox (the 120 Hz work) sits at its top. One 1 MiB chunk mapped uncached at a time, for the debug
+    // VRAM read/write selectors only (never from the display path).
+    IOLock *carveLock{nullptr};
+    IOMemoryMap *carveMap{nullptr};
+    uint64_t carveChunk{~0ull};
+    volatile uint32_t *carvePtr(uint64_t off);
     uint32_t blitCtx{0};
     bool sdmaUp{false};
     const char *blitBroken{nullptr};      // why GPU copies are off until reboot; nullptr while they are on
@@ -433,6 +440,7 @@ bool PhxBringup::start(IOService *provider) {
     smuLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
     blitLock = IOLockAlloc();
+    carveLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
     if (mmio) {
@@ -526,6 +534,11 @@ void PhxBringup::stop(IOService *provider) {
         sysBuf->release();
         sysBuf = nullptr;
     }
+    OSSafeReleaseNULL(carveMap);
+    if (carveLock) {
+        IOLockFree(carveLock);
+        carveLock = nullptr;
+    }
     if (blitLock) {
         IOLockFree(blitLock);
         blitLock = nullptr;
@@ -609,11 +622,41 @@ void PhxBringup::hdpFlush() const {
 
 // Read-only: count dwords from VRAM at byteOff, through the BAR0 aperture. Used by debug selector 102 to
 // find the live console framebuffer and a free (all-zero) VRAM region for the PSP structures.
+// The carve-out past the BAR, one uncached 1 MiB chunk at a time (carveLock held). nullptr past the carve-out.
+volatile uint32_t *PhxBringup::carvePtr(uint64_t off) {
+    if (!fbPhys || off + 4 > fbSize)
+        return nullptr;
+    const uint64_t chunk = off & ~0xFFFFFull;
+    if (chunk != carveChunk) {
+        OSSafeReleaseNULL(carveMap);
+        carveChunk = ~0ull;
+        if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(fbPhys + chunk),
+                                                                              1u << 20, kIODirectionInOut)) {
+            carveMap = md->map(kIOMapInhibitCache);
+            md->release();
+        }
+        if (!carveMap)
+            return nullptr;
+        carveChunk = chunk;
+    }
+    return reinterpret_cast<volatile uint32_t *>(carveMap->getVirtualAddress() + (off - chunk));
+}
+
 IOReturn PhxBringup::vramRead(uint32_t byteOff, uint32_t count, uint32_t *out) {
     if (!fbAper)
         return kIOReturnNotReady;
-    if ((byteOff & 3) || (static_cast<uint64_t>(byteOff) + static_cast<uint64_t>(count) * 4) > fbAperLen)
+    if ((byteOff & 3) || count > 256)
         return kIOReturnBadArgument;
+    if (static_cast<uint64_t>(byteOff) + static_cast<uint64_t>(count) * 4 > fbAperLen) {   // past the BAR (build 41)
+        if (!carveLock || ((byteOff + count * 4 - 1) & ~0xFFFFFu) != (byteOff & ~0xFFFFFu))
+            return kIOReturnBadArgument;   // one chunk per call
+        IOLockLock(carveLock);
+        volatile uint32_t *p = carvePtr(byteOff);
+        for (uint32_t i = 0; p && i < count; i++)
+            out[i] = p[i];
+        IOLockUnlock(carveLock);
+        return p ? kIOReturnSuccess : kIOReturnBadArgument;
+    }
     volatile uint32_t *v = reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + byteOff);
     for (uint32_t i = 0; i < count; i++)
         out[i] = v[i];
@@ -1640,8 +1683,20 @@ IOReturn PhxBringup::doorbellWrite(uint64_t byteOff, uint64_t value) {
 IOReturn PhxBringup::vramWrite(uint32_t byteOff, uint32_t value) {
     if (!fbAper)
         return kIOReturnNotReady;
-    if ((byteOff & 3) || static_cast<uint64_t>(byteOff) + 4 > fbAperLen)
+    if (byteOff & 3)
         return kIOReturnBadArgument;
+    if (static_cast<uint64_t>(byteOff) + 4 > fbAperLen) {   // past the BAR (build 41)
+        if (!carveLock)
+            return kIOReturnNotReady;
+        IOLockLock(carveLock);
+        volatile uint32_t *p = carvePtr(byteOff);
+        if (p) {
+            *p = value;
+            __asm__ __volatile__("mfence" ::: "memory");
+        }
+        IOLockUnlock(carveLock);
+        return p ? kIOReturnSuccess : kIOReturnBadArgument;
+    }
     *reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + byteOff) = value;
     __asm__ __volatile__("sfence" ::: "memory");
     return kIOReturnSuccess;
