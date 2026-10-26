@@ -1840,9 +1840,9 @@ static int hz_train(uint8_t idx, uint32_t symclk)
 }
 static int hz_otg_hz(void)   // the panel's refresh as OTG0's frame counter sees it over ~1 s, in mHz
 {
-   const uint32_t c0 = rd_abs(0x504d) & 0xffffff; const double t0 = now_ms();   // OTG0_OTG_STATUS_FRAME_COUNT
+   const uint32_t c0 = rd_abs(0x500d) & 0xffffff; const double t0 = now_ms();   // OTG0_OTG_STATUS_FRAME_COUNT (DCN 3.5: 0x1b4d + 0x34c0)
    usleep(1000000);
-   const uint32_t c1 = rd_abs(0x504d) & 0xffffff; const double t1 = now_ms();
+   const uint32_t c1 = rd_abs(0x500d) & 0xffffff; const double t1 = now_ms();
    return (int)(((c1 - c0) & 0xffffff) * 1e6 / (t1 - t0));
 }
 static int hz_switch(int hz)
