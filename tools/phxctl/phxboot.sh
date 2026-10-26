@@ -39,11 +39,12 @@ m2_fail() {
 # IONDRV when PhxAMDFB was not armed) before telling which one took it
 wait_fb() { for i in $(seq 1 90); do ioreg -rc IOFramebuffer -d0 | grep -q 'class ' && break; sleep 1; done; }
 if [ -e "$OFF" ]; then echo "kill switch present: nothing to do"; release; exit 0; fi
-# The boot before turned SDMA copies on (end of this script) and never got a minute past it: SDMA copies off, the rest of
-# the bring-up and WindowServer on the GPU stay (build 38 hung WindowServer's display pipe that way, 2026-10-26 22:11)
+# The boot before turned SDMA copies on (as WindowServer got the panel) and never got a minute past it: the hang is put
+# on SDMA alone - SDMA copies off, the bring-up mark cleared so no kill switch, WindowServer stays on the GPU (build 38
+# hung WindowServer's display pipe that way, 2026-10-26 22:11)
 if [ -e $G/gpucopy.pending ]; then
     echo "the last boot hung within a minute of turning SDMA copies on: SDMA copies off ($G/phxboot-gpucopy removed)"
-    rm -f $G/gpucopy.pending $G/phxboot-gpucopy; sync
+    rm -f $G/gpucopy.pending $G/phxboot-gpucopy "$MARK"; sync
 fi
 if [ -e "$MARK" ]; then
     echo "previous attempt did not finish: phxboot and PhxAMDFB off"
@@ -91,6 +92,16 @@ if [ $M2 = 1 ]; then
     before=$(ls $DR | grep -c '^WindowServer[-_]')
     release
     echo "armed and released at $(date '+%T'); agdc $(sysctl -n debug.phxagdc)"
+    # Frames copied by SDMA into a second buffer the display flips to (PhxBringup 36+), once fps_check.sh passed
+    # ($G/phxboot-gpucopy): from WindowServer's first frame now (it used to wait ~2.5 min, after the watch below,
+    # 2026-10-27). $G/gpucopy.pending stays for a minute: a hang inside it makes the next boot switch SDMA copies off.
+    if [ -e $G/phxboot-gpucopy ]; then
+        touch $G/gpucopy.pending; sync
+        sysctl -w debug.nvaccel_iop_gpucopy=1 >/dev/null 2>&1 && echo "frames copied by SDMA, flipped by the display"
+        ( sleep 60
+          echo "SDMA after a minute: $(sysctl -n debug.phxscanout_copies 2>/dev/null) frames; state: $(sysctl -n debug.phxscanout_state 2>/dev/null); dropped by the pixel check: $(sysctl -n debug.phxscanout_mismatch 2>/dev/null)"
+          rm -f $G/gpucopy.pending; sync ) &
+    fi
     for ((t = 0; t < 90; t += 5)); do
         sleep 5 & wait $!   # wait, not sleep: a SIGTERM runs the trap at once
         n=$(( $(ls $DR | grep -c '^WindowServer[-_]') - before ))
@@ -109,17 +120,6 @@ else
 fi
 [ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && echo "PhxAMDFB armed for the next boot"
 rm -f "$MARK"; sync
-# Frames copied by SDMA into a second buffer the display flips to (PhxBringup 36+), once fps_check.sh / gpu_copy_test.sh
-# passed ($G/phxboot-gpucopy): only now, with WindowServer through its first 90 s on the GPU, and watched for a minute.
-# A hang inside that minute leaves $G/gpucopy.pending, and the next boot switches SDMA copies off (see the top).
-if [ $M2 = 1 ] && [ -e $G/phxboot-gpucopy ]; then
-    touch $G/gpucopy.pending; sync
-    f0=$(sysctl -n debug.phxscanout_copies 2>/dev/null || echo 0)
-    sysctl -w debug.nvaccel_iop_gpucopy=1 >/dev/null 2>&1 && echo "frames copied by SDMA, flipped by the display, from $(date '+%T')"
-    sleep 60 & wait $!
-    echo "SDMA: $(( $(sysctl -n debug.phxscanout_copies 2>/dev/null || echo 0) - f0 )) frames in 60 s; state: $(sysctl -n debug.phxscanout_state 2>/dev/null); dropped by the pixel check: $(sysctl -n debug.phxscanout_mismatch 2>/dev/null)"
-    rm -f $G/gpucopy.pending; sync
-fi
 echo "done $(date '+%T')"
 
 # A GPU hang leaves WindowServer waiting on a fence until watchdogd kills it, and every WindowServer after it hangs the
