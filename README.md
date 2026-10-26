@@ -9,6 +9,15 @@ It is not affiliated with or endorsed by the nullarc project.
 
 **Русский: [README_RU.md](README_RU.md)**
 
+> [!WARNING]
+> **Tested on exactly one machine**: the author's Lenovo laptop with a Radeon 880M (Strix Point), macOS 15.8.1, booted
+> through OpenCore from a USB stick. Nothing else has ever run this code. There is **no guarantee that it works on your
+> machine, or at all**: it programs the GPU's firmware loader, memory controller and display engine directly, and a
+> mistake can hang the Mac, panic it or leave the panel black until a reboot. Use it only if you can recover from that
+> (boot from another EFI, `-phxbringupoff`, see [the way back](#switches-flags-and-the-way-back)). Provided as is, with
+> no warranty of any kind.
+
+
 ## Status
 
 Measured on the reference machine (Lenovo laptop, Ryzen AI with Radeon 880M, 3072x1920 30-120 Hz eDP panel,
@@ -21,6 +30,73 @@ macOS 15.8.1) in October 2026:
 | **Display** | Native 3072x1920 at 60 Hz. Each composited frame is copied by **SDMA** into one of two buffers in the carve-out (0.84 ms for a 3K frame, 28 GB/s) and the display flips to it at vblank: 61.7 fps at 3K, no tearing, no CPU in the copy. The display engine (DCN 3.5) cannot read system RAM under macOS (its rIOMMU is never enabled). |
 | **Not yet** | 120 Hz (needs a link retrain at HBR3 through DMCUB), video decode/encode, external displays, backlight control. |
 
+## Differences from nullarc
+
+nullarc targets the Radeon 780M (Phoenix, GC 11.0.1) under macOS Tahoe 26. StrixArc keeps its architecture and changes:
+
+| | nullarc (780M) | StrixArc (880M) |
+|---|---|---|
+| GPU | GC 11.0.1, PCI 1002:1900 | GC 11.5.0, PCI 1002:150E; GCVM registers translated by table (`src/amd/rdna3_chip.h`), MES gets Strix's IP bases |
+| PSP | 13.0.4, firmware-owned TMR | 14.0.0: the driver owns the TMR (`SETUP_TMR`, 0x8900000 bytes at 512 MiB below the top of VRAM), firmware plan read from the headers (`fwplan`), PSP ring at 48 MiB (out of a 3K frame) |
+| HDP flush | NBIO remap register | NBIO 7.11 moved it past BAR5: flushed through `BIF_BX_PF1_HDP_MEM_COHERENCY_FLUSH_CNTL` directly |
+| VM faults | stall | redirected to a dummy page by default (the gfx CP reads one unmapped address at the first IB of every new VMID context) |
+| Display | the CPU copies each frame into the carve-out (fast on the 780M) at 120 Hz | CPU writes into the carve-out run at ~55 MB/s and through the BAR at ~600 MB/s (a 3K frame: 20-37 ms), and DCN 3.5 cannot scan system RAM (no rIOMMU under macOS): **SDMA copies the frame into a second buffer and the display flips to it** (below) |
+| Resolution | the firmware's | native 3072x1920 through OpenCore `UEFI > Output > Resolution = Max` (the firmware used to scale 1920x1200) |
+| macOS | Tahoe 26 | Sequoia 15 (PhxAccel's non-Tahoe build) |
+| Build | Xcode on a Mac | also on Linux: upstream clang + cctools-port ld64 (`tools/cross/build-macos.sh`; a `__cxa_atexit` shim, no fortified libc calls) |
+| Mesa | canned `phoenix` | patch 0007: GC 11.5.0 and the canned `strix1` device |
+| Boot daemon | phxboot | plus: SDMA copies come on only after WindowServer's first 90 s on the GPU, a hang inside the next minute switches only SDMA off, an orderly reboot is not taken for a hang, logs of every boot are kept |
+
+## SDMA scan-out: how it works and when it falls back
+
+PhxBringup runs SDMA0 queue 0 itself (ring at VRAM 0x6000000, VMID 7 with its own page tables, two 32 MiB scan-out
+buffers at VRAM 0x8000000 and 0xA000000). For every frame WindowServer presents, with `debug.nvaccel_iop_gpucopy=1`:
+
+1. wait until the GPU has finished the work submitted before the frame (50 ms at most; past that the frame is copied
+   anyway and `phxscanout_gpulate` counts it) - WindowServer hands frames over before their composite is done;
+2. wait until the previous flip has landed (25 ms at most; else the frame is dropped, `phxscanout_busy`);
+3. one `COPY_LINEAR` of the whole frame into the buffer that is not on the panel, a GL2 write-back and a fence;
+4. 32 pixels of the copy compared with the frame (read through PhxAccel's mapping, cache lines flushed);
+5. flip DCN pipe 0 to that buffer; it latches at the next vblank.
+
+| What happens | Result |
+|---|---|
+| the source pixel still changes (the GPU is still drawing the frame) | frame dropped, the panel keeps the last one (`phxscanout_moving`) |
+| a copied pixel is wrong | frame dropped (`phxscanout_mismatch`, `phxscanout_lastbad`); **8 in a row: off until reboot** |
+| the copy does not finish in 50 ms | SDMA halted and soft-reset, **off until reboot** |
+| pipe 0 underflows, or the frame size / the firmware frame changes | **off until reboot** |
+| SDMA0 does not start, the buffers cannot be mapped | **off until reboot** |
+
+"Off" always puts the firmware's frame back on the panel first; PhxAccel then copies by CPU (about 30 fps at 3K) until
+the next boot. `sysctl debug.phxscanout_state` says `on` or why it is off; `debug.phxscanout_copies`, `_us_sum`,
+`_gpuwait_us`, `_busy`, `_moving`, `_mismatch`, `_lastbad` count the rest. `sudo sysctl -w debug.nvaccel_iop_gpucopy=0`
+switches back to the CPU copy at any time. `bash tools/phxctl/fps_check.sh` (in the test round: `go.sh`) measures both.
+
+## Switches, flags and the way back
+
+Flags are files in `/Users/Shared/gpu` (`$G`), read by the boot daemon (`/var/log/phxboot.log` says what it did). Script
+names are those of a test round folder; in the repository the Strix versions are `tools/phxctl/*_strix.sh`.
+
+| Flag | Meaning | Set by / undo |
+|---|---|---|
+| `phxboot-off` | kill switch: phxboot does nothing, the GPU stays off | set automatically when a boot did not finish its bring-up or WindowServer watch; `sudo bash install_boot.sh` (or `go.sh`) clears it |
+| `phxboot-m2` | WindowServer on the GPU (PhxAMDFB takes the panel) | `install_boot.sh --windowserver [--force]` / `--no-windowserver`; removed after 3 WindowServer crashes in 90 s or 3 GPU-hang reboots within an hour |
+| NVRAM `phxfb-boot` | arms PhxAMDFB for the next boot | re-armed by phxboot after every good M2 boot; `sudo nvram -d phxfb-boot` |
+| `phxboot-gpucopy` | SDMA copies at boot | created when `fps_check.sh` sees SDMA pass; `sudo rm` it to go back to the CPU copy |
+| `gpucopy.pending` | the SDMA minute of this boot is running | automatic; found at the next boot it means a hang: `phxboot-gpucopy` is removed |
+| `phxboot-apps` | Metal for every app when WindowServer is not on the GPU | `sudo touch` / `sudo rm` |
+| `logs/*-atboot` | each boot's logs, ~100 s after boot (the last 6) | automatic; `nullarc_logs.sh` copies them to the USB stick |
+
+Backups and how to undo each change:
+
+| Change | Undo |
+|---|---|
+| PhxBringup.kext in `EFI/OC/Kexts` on the stick | each update leaves `EFI-backup-<date>-build<N>/PhxBringup.kext` at the stick's root: copy it back; boot-arg `-phxbringupoff` disables PhxBringup entirely |
+| PhxAccel.kext in the Auxiliary KC | `sudo bash update_accel.sh --undo` (backups in `/Users/Shared/nullarc-backup/accel-update.*`) |
+| native 3K (OpenCore `Resolution=Max`) | `EFI/OC/config-1920x1200.plist` is the config from before: copy it over `config.plist` |
+| the boot daemon | `sudo bash install_boot.sh --undo` (the GPU is no longer brought up at boot) |
+| HiDPI modes | `sudo bash gpu/hidpi.sh --undo` |
+
 ## How the frame reaches the panel
 
 ```
@@ -31,7 +107,6 @@ WindowServer --Metal--> NVMTLDriver --Vulkan--> RADV --submit--> PhxBringup (gfx
              check 32 pixels against the frame, flip DCN pipe 0 at vblank (DCSURF_PRIMARY_SURFACE_ADDRESS)
 ```
 
-Any failure on that path puts the firmware's frame back on the panel and the CPU copy takes over until reboot.
 The details, with every measurement, are in [docs/strix-point.md](docs/strix-point.md).
 
 ## Layout
