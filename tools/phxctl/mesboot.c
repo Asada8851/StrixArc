@@ -1650,11 +1650,23 @@ static int aux_xfer(uint8_t action, uint32_t addr, const uint8_t *wr_data, unsig
    else {
       const unsigned n = (st >> 24) & 0x1f;
       uint8_t buf[32] = {0};
-      // as dce_aux.c: index 0 and RW once, then sequential reads (the index moves on by itself); the first byte is the
-      // reply code. Setting the index before every read (round 40) returned the data shifted by one.
-      wr_abs(AUXR_SW_DATA, 0x80000001u);
-      for (unsigned i = 0; i < n && i < 32; i++) buf[i] = (uint8_t)(rd_abs(AUXR_SW_DATA) >> 8);
-      ret = n ? buf[0] : -2;
+      // The reply: byte 0 the reply code, then the data. Each read of AUX_SW_DATA reports the index it came from
+      // (bits 20:16, the trace of Linux: 00000001 = index 0 data 00, 00018001 = index 1 data 80), so the bytes are put
+      // where their index says: rounds 40 and 41 took the n reads in order and got the data one byte early (the first
+      // read after the index write already came from index 1). No index 0 seen: the engine reported no error, ACK.
+      wr_abs(AUXR_SW_DATA, 0x80000001u);                       // index 0, read
+      uint32_t seen = 0, raw[34] = {0};
+      for (unsigned k = 0; k < n + 2 && k < 34; k++) {
+         const uint32_t v = raw[k] = rd_abs(AUXR_SW_DATA), idx = (v >> 16) & 0x1f;
+         if (idx < n && idx < 32 && !(seen & (1u << idx))) { buf[idx] = (uint8_t)(v >> 8); seen |= 1u << idx; }
+         if (seen == (n >= 32 ? 0xffffffffu : (1u << n) - 1)) break;
+      }
+      if (getenv("AUX_DEBUG")) {
+         printf("aux: status %08x, %u reply bytes, raw:", st, n);
+         for (unsigned k = 0; k < n + 2 && k < 34; k++) printf(" %08x", raw[k]);
+         printf("\n");
+      }
+      ret = !n ? -2 : (seen & 1u) ? (buf[0] & 0x30) : 0;
       if (!write && rd) memcpy(rd, buf + 1, n > 1 ? (n - 1 < len ? n - 1 : len) : 0);
    }
    wr_abs(AUXR_INT, rd_abs(AUXR_INT) | 2u);

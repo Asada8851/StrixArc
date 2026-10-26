@@ -13,14 +13,18 @@ LOGS=~/gpu/nullarc_logs.sh; [ -f "$HERE/nullarc_logs.sh" ] && LOGS="$HERE/nullar
 : > "$LOG"
 say() { echo "$1"; echo "$1" >> "$LOG"; }
 run() { say "\$ mesboot $*"; sudo "$MB" "$@" 2>&1 | grep -v 'never been brought up' | tee -a "$LOG"; return ${PIPESTATUS[0]}; }
+rundbg() { say "\$ AUX_DEBUG=1 mesboot $*"; sudo env AUX_DEBUG=1 "$MB" "$@" 2>&1 | grep -v 'never been brought up' | tee -a "$LOG"; return ${PIPESTATUS[0]}; }
 trap 'bash "$LOGS" hz120 "$LOG" | tail -1 | tee -a "$LOG"' EXIT
 say "== $(date '+%F %T') $(sw_vers -productVersion) hz_test"
 sudo -v || exit 1
 B=$(ioreg -rc PhxBringup -d1 | sed -n 's/.*"phx-build" = \([0-9]*\).*/\1/p' | head -1)
 [ "${B:-0}" -ge 41 ] || { say "STOP: PhxBringup build ${B:-?}; this needs 41"; exit 1; }
 ioreg -rc NMXAccel -d0 | grep -q NMXAccel || { say "STOP: the GPU is not up this boot"; exit 1; }
-say "== AUX check (the reply parser fixed since round 40): DPCD rev should read 14, LINK_RATE_SET 05"
-run dpcd r 0x00000 1; run dpcd r 0x00115 1; run dpcd r 0x00010 16
+say "== AUX check (replies placed by their index since round 42; raw words shown): DPCD rev 14, LINK_RATE_SET 05"
+rundbg dpcd r 0x00000 1; rundbg dpcd r 0x00115 1; rundbg dpcd r 0x00010 16
+if ! sudo "$MB" dpcd r 0x00115 1 2>/dev/null | grep -q ': 05'; then
+    say "STOP: DPCD reads do not come back right yet (raw words above); nothing was switched"; exit 1
+fi
 say "== 120 Hz in 5 s: the panel goes dark for about a second, then 20 s at 120 Hz, then back to 60 Hz (dark again)"
 for i in 5 4 3 2 1; do printf '\r   %d ' $i; sleep 1; done; echo
 run hz 120; RC=$?
