@@ -1,0 +1,77 @@
+From 25b100bb3cd0662fcc1e3aa57de49b7a77cd9ede Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 18 Oct 2026 12:27:21 -0700
+Subject: [PATCH 2/3] radv/darwin: report Radeon 780M identity for the phoenix
+ table
+
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 10 ++++++++--
+ src/amd/vulkan/radv_physical_device.c | 18 +++++++++++++-----
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index f23ef8f..32c6439 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -363,6 +363,8 @@ acd_device_get_sync_provider(acd_device_handle dev)
+ const char *
+ acd_get_marketing_name(acd_device_handle dev)
+ {
++   if (!strcmp(dev->canned->name, "phoenix"))
++      return "AMD Radeon 780M Graphics";
+    return ACD_MARKETING_NAME;
+ }
+ 
+@@ -499,9 +501,13 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+       info_read_mmr_reg(d, info->read_mmr_reg.dword_offset, info->read_mmr_reg.count,
+                         info->read_mmr_reg.instance, out);
+       return 0;
+-   case AMDGPU_INFO_DEV_INFO:
+-      *(struct drm_amdgpu_info_device *)out = d->dev;
++   case AMDGPU_INFO_DEV_INFO: {
++      struct drm_amdgpu_info_device *di = out;
++      *di = d->dev;
++      if (!strcmp(d->name, "phoenix"))
++         di->device_id = 0x1900; /* Hawk Point 780M; same gfx1103 silicon as the canned 0x15bf */
+       return 0;
++   }
+    case AMDGPU_INFO_MEMORY:
+       if (dev->core->kext)
+          return acd_info_memory(dev, info, out);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 1730aab..375c65e 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2999,16 +2999,24 @@ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+    struct radv_instance *instance = (struct radv_instance *)vk_instance;
+    struct radv_physical_device *pdev = NULL;
+ 
+-   /* Fake PCI identity of the RX 9070 XT (vendor 0x1002, device 0x7550). */
++   /* PCI identity of the canned device: RX 9070 XT (1002:7550) for gfx1201, otherwise the
++    * Firebat U6C's Radeon 780M (1002:1900 rev 0xBA, subsystem 8001:2014). */
+    static char *nodes[DRM_NODE_MAX];
+    static drmPciBusInfo bus_info;
+    static drmPciDeviceInfo device_info = {
+       .vendor_id = 0x1002,
+-      .device_id = 0x7550,
+-      .subvendor_id = 0x1002,
+-      .subdevice_id = 0x0000,
+-      .revision_id = 0xC0,
++      .device_id = 0x1900,
++      .subvendor_id = 0x8001,
++      .subdevice_id = 0x2014,
++      .revision_id = 0xBA,
+    };
++   const char *canned = getenv("RADV_DARWIN_CANNED");
++   if (canned && !strcmp(canned, "gfx1201")) {
++      device_info.device_id = 0x7550;
++      device_info.subvendor_id = 0x1002;
++      device_info.subdevice_id = 0x0000;
++      device_info.revision_id = 0xC0;
++   }
+    drmDevice drm_device = {
+       .nodes = nodes,
+       .available_nodes = 0,
+-- 
+2.39.5 (Apple Git-154)
+

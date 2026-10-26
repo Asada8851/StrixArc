@@ -1,0 +1,47 @@
+From 0d4ae8c77e846560115ad86dfc3ae0a0b116764a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 18 Oct 2026 12:33:43 -0700
+Subject: [PATCH 3/3] radv/darwin: open the PhxBringup service by default
+
+---
+ src/amd/common/darwin/ac_darwin_kext.c | 4 +++-
+ src/amd/common/darwin/ac_darwin_kext.h | 1 +
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index 15cf72d..bdac135 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -75,7 +75,7 @@ struct acd_kext {
+ };
+ 
+ /* G6: the service class of the N48N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+-static const char *volatile acd_service_class = ACD_SERVICE_BRINGUP;
++static const char *volatile acd_service_class = ACD_SERVICE_PHOENIX;
+ 
+ int
+ acd_kext_set_service_class(const char *cls)
+@@ -86,6 +86,8 @@ acd_kext_set_service_class(const char *cls)
+       acd_service_class = ACD_SERVICE_BRINGUP;
+    else if (!strcmp(cls, ACD_SERVICE_ACCELERATOR))
+       acd_service_class = ACD_SERVICE_ACCELERATOR;
++   else if (!strcmp(cls, ACD_SERVICE_PHOENIX))
++      acd_service_class = ACD_SERVICE_PHOENIX;
+    else
+       return -EINVAL;
+    return 0;
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index 115188e..f943257 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -106,6 +106,7 @@ int acd_kext_open(struct acd_kext **out);
+  * otherwise, and the previous value stays). Process-wide; the setter is not meant to be called while a connection is being opened. */
+ #define ACD_SERVICE_BRINGUP     "Navi48Bringup"
+ #define ACD_SERVICE_ACCELERATOR "Navi48Accelerator"
++#define ACD_SERVICE_PHOENIX     "PhxBringup" /* Radeon 780M bring-up kext (src/phxbringup) */
+ int acd_kext_set_service_class(const char *cls);
+ const char *acd_kext_service_class(void);
+ int acd_kext_open_iokit(struct acd_kext **out);      /* ac_darwin_iokit.c */
+-- 
+2.39.5 (Apple Git-154)
+

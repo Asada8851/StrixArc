@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>English</string>
+	<key>CFBundleExecutable</key><string>PhxAccel</string>
+	<key>CFBundleIdentifier</key><string>com.luuumi.PhxAccel</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>PhxAccel</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>0.1</string>
+	<key>CFBundleVersion</key><string>0.1</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.AppleGraphicsDeviceControl</key><string>1.0.0</string>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOSurface</key><string>1.0</string>
+		<key>com.apple.kpi.iokit</key><string>8.0</string>
+		<key>com.apple.kpi.libkern</key><string>8.0</string>
+		<key>com.apple.kpi.mach</key><string>8.0</string>
+		<key>com.apple.kpi.bsd</key><string>8.0</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>PhxFB</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.luuumi.PhxAccel</string>
+			<key>IOClass</key><string>PhxAMDFB</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- the 780M panel over the firmware (GOP) mode, at boot in place of the firmware framebuffer (IONDRV): above its
+			     score in the same category, like NullMoth's NMIntelFB. start() declines unless NVRAM phxfb-boot is set (one
+			     boot per arming), and then IONDRV still takes the device -->
+			<key>IOPCIPrimaryMatch</key><string>0x19001002 0x150E1002</string>
+			<key>IOProbeScore</key><integer>60000</integer>
+			<key>IOMatchCategory</key><string>IOFramebuffer</string>
+		</dict>
+		<key>PhxAccel</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.luuumi.PhxAccel</string>
+			<key>IOClass</key><string>NMXAccel</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- Radeon 780M (Phoenix / Hawk Point, 1002:1900) or 880M/890M (Strix Point, 1002:150E, experimental). Starts
+			     only after PhxBringup sets nmxgpu-claimed. -->
+			<key>IOPCIPrimaryMatch</key><string>0x19001002 0x150E1002</string>
+			<!-- never at boot: PhxBringup sets this on the PCI device (selector 113) once the GPU runs, then re-runs matching -->
+			<key>IOPropertyMatch</key><dict><key>nmxgpu-claimed</key><true/></dict>
+			<key>IOMatchCategory</key><string>IOAccelerator</string>
+			<key>IOProbeScore</key><integer>100</integer>
+			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
+			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
+		</dict>
+	</dict>
+</dict>
+</plist>

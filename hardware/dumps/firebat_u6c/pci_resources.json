@@ -1,0 +1,64 @@
+{
+  "system": {
+    "model": "Firebat U6C",
+    "cpu": "AMD Ryzen 7 H 255 w/ Radeon 780M Graphics",
+    "bios": "American Megatrends Inc. 1.07 (04/18/2025)",
+    "pcie_ecam_base": "0x00000000e0000000",
+    "acpi_vga_path": "\\_SB.PCI0.GP17.VGA"
+  },
+  "gpu": {
+    "name": "AMD Radeon 780M Graphics",
+    "architecture": "RDNA 3 / GFX1103 (Phoenix APU)",
+    "pci_bdf": "03:00.0",
+    "pci_vendor_id": "0x1002",
+    "pci_device_id": "0x1900",
+    "pci_subsys_vendor": "0x8001",
+    "pci_subsys_device": "0x2014",
+    "pci_revision": "0xba",
+    "pci_class": "0x030000",
+    "pci_ecam_phys_addr": "0x00000000e0300000",
+    "bar0": {
+      "type": "64-bit Prefetchable Memory (VRAM Aperture)",
+      "phys_start": "0x0000007ff0000000",
+      "phys_end": "0x0000007fffffffff",
+      "size_bytes": 268435456,
+      "size_human": "256 MiB"
+    },
+    "bar2": {
+      "type": "64-bit Prefetchable Memory (Doorbell Aperture)",
+      "phys_start": "0x00000000fc600000",
+      "phys_end": "0x00000000fc7fffff",
+      "size_bytes": 2097152,
+      "size_human": "2 MiB"
+    },
+    "bar4": {
+      "type": "I/O Port",
+      "phys_start": "0x0000ef00",
+      "phys_end": "0x0000efff",
+      "size_bytes": 256,
+      "size_human": "256 B"
+    },
+    "bar5": {
+      "type": "32-bit Non-Prefetchable Memory (MMIO Registers)",
+      "phys_start": "0x00000000fcb00000",
+      "phys_end": "0x00000000fcb7ffff",
+      "size_bytes": 524288,
+      "size_human": "512 KiB"
+    },
+    "vram_carved_uma": {
+      "size_bytes": 4293918720,
+      "size_human": "4 GiB"
+    },
+    "display": {
+      "panel": "16-inch 2560x1600 @ 120Hz",
+      "dcn_controller": "DCN 3.1.4",
+      "link": "eDP (Embedded DisplayPort)"
+    },
+    "vbios": {
+      "part_number": "113-PHXGENERIC-001",
+      "version": "VER022.012.000.029.000001",
+      "type": "ATOMBIOSBK-AMD",
+      "rom_file": null
+    }
+  }
+}

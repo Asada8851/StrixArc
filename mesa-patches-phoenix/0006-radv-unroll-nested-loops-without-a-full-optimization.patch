@@ -1,0 +1,70 @@
+From cee46d320ad94b366c146f77b9ba5e28429ac188 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 07:31:36 -0700
+Subject: [PATCH] radv: unroll nested loops without a full optimization round
+ per level
+
+nir_opt_loop_unroll unrolls only the innermost loops per call. The structurized
+Metal compositor uber-shaders (CoreAnimation fixed_frag_lpf_cpf translated to
+SPIR-V) nest ~60 loops, so radv_optimize_nir ran ~64 rounds of every pass
+(25 ms each on a 36k-instruction shader) to unroll one level per round. After
+the first three rounds keep calling the unroller until it stops making
+progress. Same final code (identical RADV_DEBUG=shaders output); a slow
+variant compiles in 1.05 s instead of 2.0 s, fast variants are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J1P3iE35XqZmNgJ7zLHELQ
+---
+ src/amd/vulkan/radv_shader.c | 27 +++++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 4de6542..839d417 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -179,6 +179,7 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
+    NIR_PASS(_, shader, nir_opt_fp_math_ctrl);
+ 
+    struct set *skip = _mesa_pointer_set_create(NULL);
++   unsigned round = 0;
+    do {
+       progress = false;
+ 
+@@ -220,16 +221,26 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
+       NIR_LOOP_PASS(progress, skip, shader, nir_opt_undef);
+ 
+       if (shader->options->max_unroll_iterations) {
+-         bool unroll_progess = false;
+-         NIR_LOOP_PASS_NOT_IDEMPOTENT(unroll_progess, skip, shader, nir_opt_loop_unroll);
+-         /* Loop unrolling can add trivial phis for constants defined in the loop,
+-          * which can break all kinds of validation if they aren't removed immediately.
++         /* A call unrolls only the innermost loops. Structurized uber-shaders (Metal compositor
++          * shaders translated to SPIR-V) nest dozens of loops that unroll one level per call, and
++          * each level would otherwise cost a full round of every pass above. Once the first rounds
++          * have simplified the shader, keep unrolling here instead.
+           */
+-         if (unroll_progess) {
+-            progress = true;
+-            NIR_LOOP_PASS(progress, skip, shader, nir_opt_remove_phis);
+-         }
++         bool unroll_progess;
++         unsigned unroll_rounds = 0;
++         do {
++            unroll_progess = false;
++            NIR_LOOP_PASS_NOT_IDEMPOTENT(unroll_progess, skip, shader, nir_opt_loop_unroll);
++            /* Loop unrolling can add trivial phis for constants defined in the loop,
++             * which can break all kinds of validation if they aren't removed immediately.
++             */
++            if (unroll_progess) {
++               progress = true;
++               NIR_LOOP_PASS(progress, skip, shader, nir_opt_remove_phis);
++            }
++         } while (unroll_progess && round >= 3 && ++unroll_rounds < 256);
+       }
++      round++;
+    } while (progress && !optimize_conservatively);
+    _mesa_set_destroy(skip, NULL);
+ 
+-- 
+2.39.5 (Apple Git-154)
+

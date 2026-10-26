@@ -1,0 +1,16 @@
+diff --git a/NVMTLDevice.m b/NVMTLDevice.m
+index 1463564..9e67ebc 100644
+--- a/NVMTLDevice.m
++++ b/NVMTLDevice.m
+@@ -491,7 +491,10 @@ static bool nvmtl_process_is_allowed(void)
+     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
+     // WindowServer before its "!WindowServer" line is reached.
+     { int hv = 0; size_t hn = sizeof hv;
+-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
++      // PhxAccel: an AMD accelerator that drives its own panel (debug.nmxaccel_headless reads 0) composites WindowServer
++      int ahv = 1; size_t ahn = sizeof ahv;
++      const bool amdPanel = nvmtl_vk_vendor() == 0x1002 && sysctlbyname("debug.nmxaccel_headless", &ahv, &ahn, NULL, 0) == 0 && !ahv;
++      if (!strcmp(me, "WindowServer") && !amdPanel && (nvmtl_vk_vendor() != 0x10de ||
+                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
+           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
+     if (getenv("NVMTL_ENABLE")) return true;

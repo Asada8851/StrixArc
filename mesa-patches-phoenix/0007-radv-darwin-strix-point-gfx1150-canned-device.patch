@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nullarc <nullarc@localhost>
+Date: Sat, 24 Oct 2026 23:59:00 +0300
+Subject: [PATCH 7/7] radv/darwin: Strix Point (gfx1150) canned device
+
+Mesa already carries a canned "strix1" entry (1002:150E, AMDGPU_FAMILY_GC_11_5_0, 16 CUs: the 890M
+configuration). Give it a GC version, so the mock kext and the handshake agree with what PhxBringup
+reports on Strix Point (11.5.0), and let a build pick its default canned device:
+  meson ... -Dc_args=-DACD_DEFAULT_CANNED='"strix1"'
+RADV_DARWIN_CANNED still overrides it at run time.
+
+Untested: applies after 0001..0006; written against the context 0001 adds. The 880M has 12 CUs, not
+the canned 16: RADV only uses the count for limits (scratch, wave counts), but the CU bitmap should
+come from the hardware before this is more than a bring-up aid.
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -89,13 +89,17 @@ static struct acd_core *g_core;
+ static const struct amdgpu_device *
+ find_canned(const char *name);
+ 
+-/* Canned device selection: RADV_DARWIN_CANNED names an amdgpu_devices[] entry, default "phoenix"
+- * (Radeon 780M / gfx1103 / GC 11.0.1). The values that used to be gfx1201 constants come from it. */
++/* Canned device selection: RADV_DARWIN_CANNED names an amdgpu_devices[] entry, default ACD_DEFAULT_CANNED:
++ * "phoenix" (Radeon 780M / gfx1103 / GC 11.0.1) unless the build sets "strix1" (Radeon 880M/890M / gfx1150 /
++ * GC 11.5.0). The values that used to be gfx1201 constants come from it. */
++#ifndef ACD_DEFAULT_CANNED
++#define ACD_DEFAULT_CANNED "phoenix"
++#endif
+ const struct amdgpu_device *
+ acd_canned_device(void)
+ {
+    const char *name = getenv("RADV_DARWIN_CANNED");
+-   return find_canned(name && *name ? name : "phoenix");
++   return find_canned(name && *name ? name : ACD_DEFAULT_CANNED);
+ }
+ 
+ uint32_t
+@@ -113,6 +117,7 @@ acd_canned_gc_version(const struct amdgpu_device *d)
+ {
+    switch (d->dev.family) {
+    case AMDGPU_FAMILY_GC_11_0_1: return (11u << 16) | (0u << 8) | 1u;
++   case AMDGPU_FAMILY_GC_11_5_0: return (11u << 16) | (5u << 8) | 0u;
+    case AMDGPU_FAMILY_GC_12_0_0: return (12u << 16) | (0u << 8) | 1u;
+    default: return 0;
+    }
+-- 
+2.39.5
+ 

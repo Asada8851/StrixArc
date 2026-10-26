@@ -1,0 +1,57 @@
+From 8f24d8a48727838911839a2f0926f0a579a6c056 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 22:39:51 -0700
+Subject: [PATCH] radv/darwin: AMDGPU_INFO_TIMESTAMP from SMUIO GOLDEN_TSC
+
+VK_EXT_calibrated_timestamps had no device clock (the query fell through to
+-EINVAL and returned 0), so the Metal layer could never place GPU times on the
+host clock and every command buffer reported GPUStartTime = GPUEndTime = 0.
+PhxBringup build 31 lets any client read GOLDEN_TSC (0x16a2d/0x16a2e), the
+100 MHz counter the CP stamps with.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/common/darwin/ac_darwin_drm.c  | 12 ++++++++++++
+ src/amd/common/darwin/ac_darwin_kext.h |  3 +++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 32c6439..317d4e4 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -534,6 +534,18 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+       return -EINVAL;
+    case AMDGPU_INFO_VIDEO_CAPS:
+       return 0;
++   case AMDGPU_INFO_TIMESTAMP: {
++      /* the GPU clock VK_EXT_calibrated_timestamps pairs with the host clock: upper, lower, upper again (the lower
++       * half wraps every 43 s) */
++      uint32_t v[2], hi;
++      if (!dev->core->kext || acd_kext_read_regs(dev->core->kext, ACD_GOLDEN_TSC_UPPER_REG, 2, v) ||
++          acd_kext_read_regs(dev->core->kext, ACD_GOLDEN_TSC_UPPER_REG, 1, &hi))
++         return -EINVAL;
++      if (hi != v[0] && acd_kext_read_regs(dev->core->kext, ACD_GOLDEN_TSC_UPPER_REG + 1, 1, &v[1]))
++         return -EINVAL;
++      *(uint64_t *)out = (uint64_t)hi << 32 | v[1];
++      return 0;
++   }
+    default:
+       /* the drm-shim also answers -EINVAL here */
+       return -EINVAL;
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index f943257..eee3a5c 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -74,6 +74,9 @@ enum acd_sel {
+ #define ACD_TIMEOUT_INFINITE    0xffffffffffffffffull /* == AMDGPU_TIMEOUT_INFINITE */
+ #define ACD_GB_ADDR_CONFIG_GFX1201 0x08200545u
+ #define ACD_GB_ADDR_CONFIG_REG     0x263eu
++/* SMUIO GOLDEN_TSC upper/lower (Phoenix, SMUIO 13.0.7): the 100 MHz counter the CP stamps; ReadRegs answers it for
++ * every client (PhxBringup build 31) */
++#define ACD_GOLDEN_TSC_UPPER_REG   0x16a2du
+ 
+ struct acd_kext_ops {
+    /* IOConnectCallMethod; returns the kern_return_t / IOReturn. */
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,43 @@
+binary header v1.1 size=1212
+ip discovery v3, dies=1, 64-bit base addresses=False
+
+ die 0: 39 IP blocks
+  ACP          inst 0  v6.3.0  bases: 0x480000 0x2403800
+  ATHUB        inst 0  v3.0.1  bases: 0xc00 0x13300 0x2408c00
+  CLKA         inst 0  v13.0.3  bases: 0x16c00 0x2401800
+  CLKA         inst 1  v13.0.3  bases: 0x16e00 0x2401c00
+  CLKA         inst 2  v13.0.3  bases: 0x17000 0x2402000
+  CLKA         inst 3  v13.0.3  bases: 0x17200 0x2402400
+  CLKA         inst 4  v13.0.3  bases: 0x1b000 0x242d800
+  CLKA         inst 5  v13.0.3  bases: 0x1b200 0x242dc00
+  CLKA         inst 6  v13.0.3  bases: 0x1b400 0x242e000
+  DBGU_IO      inst 0  v2.0.2  bases: 0x1e0 0x240b400
+  DBGU_IO      inst 1  v2.0.2  bases: 0x260 0x2413c00
+  DBGU_IO      inst 2  v2.0.2  bases: 0x280 0x2416000
+  DMU          inst 0  v3.1.4  bases: 0x12 0xc0 0x34c0 0x9000 0x2403c00
+  DF           inst 0  v4.0.0  bases: 0x7000 0xc00000 0x240b800 0x7c00000 0x12400000
+  FCH          inst 0  v8.1.0  bases: 0x2c0 0xb40000 0x240c000 0x11000000
+  FUSE         inst 0  v13.0.3  bases: 0x17400 0x2401400
+  GC           inst 0  v11.0.1  bases: 0x1260 0xa000 0x2402c00
+  HDP          inst 0  v5.2.1  bases: 0xf20 0x240a400
+  IOHC         inst 0  v7.0.1  bases: 0x10000 0x2406000 0x4ec0000
+  LSDMA        inst 0  v6.0.1  bases: 0x11400
+  ISP          inst 0  v3.0.1  bases: 0x18000 0x240b000
+  MMHUB        inst 0  v3.0.1  bases: 0x13200 0x1a000 0x2408800
+  MP0(PSP)     inst 0  v13.0.4  bases: 0x4000 0x16000 0xdc0000 0xe00000 0xe40000 0x243fc00
+  MP1(SMU)     inst 0  v13.0.4  bases: 0x4000 0x16000 0xdc0000 0xe00000 0xe40000 0x243fc00
+  MP2          inst 0  v13.0.4  bases: 0x4000 0x16000 0xdc0000 0xe00000 0xe40000 0x243fc00
+  NBIF         inst 0  v7.7.0  bases: 0x0 0x14 0xd20 0x10400 0x241b000 0x4040000
+  OSSSYS       inst 0  v6.0.1  bases: 0x10a0 0x240a000
+  PCIE         inst 0  v6.0.0  bases: 0x0 0x14 0xd20 0x10400 0x241b000 0x4040000
+  PCIE         inst 1  v6.0.0  bases: 0x0 0x14 0xd20 0x10400 0x241b000 0x4040000
+  SDMA0        inst 0  v6.0.1  bases: 0x1260 0xa000 0x2402c00
+  SATA         inst 0  v0.0.0  bases: 
+  hwid282      inst 0  v13.0.1  bases: 0xbc0000
+  SMUIO        inst 0  v13.0.7  bases: 0x16800 0x16a00 0x440000 0x2401000
+  THM          inst 0  v13.0.3  bases: 0x16600 0x2400c00
+  UMC          inst 0  v11.5.0  bases: 0x14000 0x54000 0x2425800 0x2425c00 0x2447c00 0x2448000 0x3680000 0x36c0000
+  UMC          inst 1  v11.5.0  bases: 0x94000 0xd4000 0x2426000 0x2426400 0x2448400 0x2448800 0x3700000 0x3740000
+  VCN          inst 0  v4.0.2  bases: 0x7800 0x7e00
+  hwid286      inst 0  v4.0.1  bases: 0x2403000
+  XGBE         inst 0  v0.0.0  bases: 

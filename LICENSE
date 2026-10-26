@@ -1,0 +1,34 @@
+# StrixArc — licenses
+
+StrixArc is a port of nullarc (https://github.com/luuumi-dev/nullarc) to the Radeon 880M/890M; every part keeps the
+license it has in nullarc, as below. The nullarc name, mark and wordmark (nullarc's `assets/brand`) are not part of
+this repository.
+
+nullarc combines code under several licenses. Each part below names its license; the full texts are in
+[`LICENSES/`](LICENSES). [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists the third-party components that the
+release packages carry, with their notices and where their source is.
+
+| Part | License |
+|---|---|
+| `src/phxbringup`, `tools/phxctl`, `tools/*` and the rest of the code written for nullarc, unless a file says otherwise | MIT ([`LICENSES/MIT.txt`](LICENSES/MIT.txt)), or at your option GPL-2.0-only ([`LICENSES/GPL-2.0-only.txt`](LICENSES/GPL-2.0-only.txt)) |
+| `src/phxaccel`, `src/nmplugin`, `tools/nvmtl-patches` — derived from NullMoth's macOS driver | PolyForm Noncommercial 1.0.0 ([`LICENSES/PolyForm-Noncommercial-1.0.0.txt`](LICENSES/PolyForm-Noncommercial-1.0.0.txt)) |
+| `mesa-patches-phoenix` | MIT, as Mesa |
+| Files taken from Linux `amdgpu` (`tools/phxctl/mes_v11_api_def.h`, `tools/phxctl/csb_gfx11.h`) | MIT, © Advanced Micro Devices, Inc. (notice in each file) |
+
+## PolyForm Noncommercial
+
+The parts derived from NullMoth may be used, changed and shared **for noncommercial purposes only**. Anyone who
+receives them must also receive the license terms and this line, which the licensor provided with the software:
+
+```
+Required Notice: Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)
+```
+
+## What the release packages add
+
+The release archives also contain binaries built from other projects: Mesa RADV (MIT), the NullMoth shader translator
+`libnvmtl_translate.dylib` (LGPL-3.0-or-later, from metal2vulkan), LLVM and zstd libraries inside the plugin bundle
+(Apache-2.0 WITH LLVM-exception, BSD), and AMD GPU microcode from linux-firmware (`LICENSE.amdgpu`: redistribution in
+binary form only, no reverse engineering). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Nothing from Apple is redistributed: macOS components the driver needs at run time come from the user's own system.

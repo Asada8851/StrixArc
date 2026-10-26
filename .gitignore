@@ -1,0 +1,37 @@
+# Build outputs and compilation artifacts
+build/
+dist/
+*.o
+*.dylib
+*.bin
+*.kext/
+*.bundle/
+*.dSYM/
+*.pyc
+__pycache__/
+
+# macOS and OS metadata
+.DS_Store
+._*
+
+# Editor, IDE and local agent metadata
+.vscode/
+.idea/
+.omo/
+.slim/
+memory/
+.current_notepad
+
+# Firmware test fixtures (downloaded by `make fixtures`, not committed)
+tests/fixtures/
+
+# Reference dumps and vendor assets if downloaded locally
+reference/
+
+# ACPI MSDM carries the Windows product key: never commit it
+MSDM.bin
+MSDM.dsl
+
+# Firmware images (VBIOS, ACPI VFCT carrying it) are AMD/OEM copyright with no redistribution grant
+*.rom
+VFCT.bin
