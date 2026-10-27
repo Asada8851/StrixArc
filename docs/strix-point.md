@@ -258,3 +258,48 @@ publishes TOM/TOM2/SYSCFG/MTRRdefType/PAT and the variable MTRRs (`phx-msr-*`): 
 3K note: the PSP ring sits at VRAM 0x1100000, inside a 3072x1920 surface at offset 0 (22.5 MiB). With the frames in
 the two scan-out buffers the firmware's surface only matters until the first flip, but the ring should move before a
 3K GOP mode is used.
+
+## 120 Hz under macOS: the link retrained at 8.1 Gb/s through the GOP's DMCUB (2026-10-27)
+
+`mesboot hz 60|120 [again]` replays Linux DC's sequence above by registers and through DMCUB's INBOX1. The firmware
+(the GOP) started DMCUB, so commands go to *its* DMCUB firmware, not Linux's: VBIOS LVTMA_CONTROL (type 128 sub 15)
+and DIG1_TRANSMITTER_CONTROL (sub 1, `dig_transmitter_control_parameters_v1_7`, the bytes of the trace). The DLG/TTU
+values come from the firmware's linear 3K@60 setup (Linux's are for its tiled surface): the refclk-per-pixel fields
+halved for 120 Hz, `DP_DTO0_PHASE` doubled with the firmware's modulo, `DP0_DP_VID_M` scaled by pixel clock / link rate.
+The firmware's 60 Hz values are saved once (`/Users/Shared/gpu/hz60.base`) and are what `hz 60` puts back.
+
+What it took, round by round (hz_test.sh logs):
+
+- **AUX**: each read of `AUX_SW_DATA` reports the index it came from (bits 20:16); the first read after the index write
+  already comes from index 1. Taken in order, every DPCD read was one byte early.
+- **DMCUB's trace buffer** (window 5: `dmub_debugfs_trace_header`, 16-byte entries code/tick/param0/param1; 0x21 starts
+  a command with its VBIOS sub-type, 0x22 ends it) shows what the firmware did with each command. `mesboot` prints the
+  new entries after every command.
+- **Swing 3 stops the GOP's DMCUB for good** (laneset 07 at HBR3: INBOX1's read pointer never moved again, every later
+  command - the way back included - queued up unseen). Lane settings are capped at swing 2 / pre-emphasis 2 now, with
+  MAX_*_REACHED to the sink only; once a command is not taken, no more are sent.
+- **The firmware's HPD handler.** TRANSMITTER ENABLE at 81000 (x10 kHz) did reprogram the PHY (trace: 0x00e8
+  a8c0 -> 13c68, a rate-change sequence), but the GOP's DMCUB firmware answers every HPD event (trace 0x1a p0 9 /
+  0x1b 0x10: after TRANSMITTER POWER_OFF, after POWER_ON, and once more in the middle of the rate change) by
+  re-enabling the PHY with the link settings the GOP left it in region 4 (+0x5318 and +0x531c: symclk 43200; laneset 08
+  at +0x5324; trace 0x3a = those words). So the PHY went back to 4.32 Gb/s by itself while the panel waited at 8.1:
+  no lane locked. `hz` now moves those two words to the new symclk before the switch (and back with it); the handler's
+  re-enable is then at the right rate and harmless.
+- Linux also writes `BIOS_SCRATCH_6` (abs. 0x52: ACC_MODE 0x10, CRITICAL_STATE 0x100 during the modeset) and the PSP
+  ring write pointer (`MPASP_SMN_C2PMSG_67`, abs. 0x16083: the DTM/HDCP TA on stream enable); neither was needed.
+
+Result: clock recovery in one step, equalization in three (laneset 00 -> 08, the panel's own request), 1.5 s for the
+whole switch, OTG at 119.9 Hz, no underflow, and the way back to 60 Hz just as clean.
+
+At boot (`$G/phxboot-120`), phxboot runs `HZ_QUIET=1 mesboot hz 120` while PhxAMDFB still holds WindowServer back
+(the busy hold), then `sysctl debug.phxfb_remeasure=1`: PhxAMDFB measures OTG0 again (30 frames, snapped to 120.000 Hz),
+so the display mode, the VBL tick and the AGDC panel timing say 120 Hz before WindowServer opens the panel. macOS
+then reports "3072 x 1920 @ 120.00Hz" and composites at 120 fps (fps_check: 122 frames/s presented, the test window
+119.1-119.6 moves/s, 2.0-2.5 ms per frame in the display pipe; WindowServer 26-47 % of a core). A failed switch puts
+60 Hz back and removes the flag; `$G/hz120.pending` stays until WindowServer's 90 s watch is over, so a hang or the
+power button held on a dark panel turns 120 Hz off for the next boot.
+
+Still slow: some heavy animations (Launchpad folders opening) drop to 25-60 fps (not measured per frame yet). A likely
+part of it: the display transaction waits synchronously for the frame's GPU work, the previous flip and the copy
+(2-2.5 ms of the 8.3 ms budget); the next step is to queue the copy behind a fence (SDMA polling the composite's
+completion) instead of waiting in WindowServer's present.
