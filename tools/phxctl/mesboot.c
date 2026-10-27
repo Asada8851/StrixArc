@@ -1905,6 +1905,24 @@ static void hz_sink(const char *when)   // what the panel's receiver sees: lane 
    if (r) printf("hz: sink %s: no AUX reply (%d)\n", when, r);
    else printf("hz: sink %s: lanes %02x %02x align %02x adjust %02x %02x, power %02x\n", when, st[0], st[1], st[2], st[4], st[5], pw);
 }
+// The link settings the GOP left DMCUB in region 4 (its shared memory, +0x5300): the firmware re-enables the PHY with
+// them on every HPD event - after panel power-on, and once more in the middle of a rate change (round 43: TRANSMITTER
+// ENABLE at 8.1 Gb/s worked, then the firmware's handler put the PHY back to 4.32 Gb/s on its own, trace code 0x3a
+// = these two words). So they are moved to the new rate before the switch. -1 = not what was expected, left alone.
+static int hz_fwlink(uint32_t from, uint32_t to)
+{
+   const uint64_t r4 = (((uint64_t)rd_abs(DMCUB_R4_OFF_HI) << 32) | rd_abs(DMCUB_R4_OFF)) - VRAM_MC;
+   printf("hz: the firmware's link settings (region 4 +0x5300):");
+   for (unsigned i = 0; i < 0x70; i += 4) printf("%s %08x", i % 32 ? "" : "\n   ", vr(r4 + 0x5300 + i));
+   printf("\n");
+   const uint32_t a = vr(r4 + 0x5318), b = vr(r4 + 0x531c);
+   if (a == to && b == to) { printf("hz: they are at symclk %u already\n", to); return 0; }
+   if (a != from || b != from) { printf("hz: they are not at symclk %u (%u %u): left alone\n", from, a, b); return -1; }
+   vw(r4 + 0x5318, to); vw(r4 + 0x531c, to);
+   const int ok = vr(r4 + 0x5318) == to && vr(r4 + 0x531c) == to;
+   printf("hz: the firmware's link settings now at symclk %u%s\n", to, ok ? "" : ": the write did NOT stick");
+   return ok ? 0 : -1;
+}
 static int hz_otg_hz(void)   // the panel's refresh as OTG0's frame counter sees it over ~1 s, in mHz
 {
    const uint32_t c0 = rd_abs(0x500d) & 0xffffff; const double t0 = now_ms();   // OTG0_OTG_STATUS_FRAME_COUNT (DCN 3.5: 0x1b4d + 0x34c0)
@@ -1924,7 +1942,7 @@ static int hz_switch(int hz, int force)
    if (!now_hz) { printf("hz: STOP: unknown link state\n"); return 1; }
    if (now_hz == hz && !force) { printf("hz: already there\n"); return 0; }
    if (now_hz == hz) printf("hz: the same rate again: the whole power-off / link training cycle, nothing else changes\n");
-   dmub_verbose = 1;
+   dmub_verbose = !getenv("HZ_QUIET");                            // the boot daemon: no DMCUB trace per command
    hz_sink("before");
    if (!hz_base(base, now_hz == 60)) { printf("hz: STOP: no 60 Hz values saved (%s) and the panel is not at 60 Hz\n", HZ_BASE); return 1; }
    if (dpcd_read(0x10, table, 16)) { printf("hz: STOP: cannot read the link-rate table\n"); return 1; }
@@ -1933,6 +1951,8 @@ static int hz_switch(int hz, int force)
    const uint32_t symclk = rate * 2;                                      // 10 kHz units: 40500 -> 81000 (810 MHz)
    printf("hz: LINK_RATE_SET %u = %u.%02u Gb/s, symclk %u0 kHz\n", want, rate / 5000, (rate / 50) % 100, symclk);
    if ((hz == 120 && rate != 40500) || (hz == 60 && rate != 21600)) { printf("hz: STOP: not the rate table of the 880M's panel\n"); return 1; }
+   const uint32_t symclk_now = (uint32_t)(table[idx * 2] | (table[idx * 2 + 1] << 8)) * 2;
+   hz_fwlink(symclk_now, symclk);
    const double t0 = now_ms();
    const uint32_t dpg0 = rd_abs(0x4d14), vtg0 = rd_abs(0x39f7) | 0x80000000u;   // the firmware's DPG mode, VTG on
    if (hz == 120) { dcn_smu(8, 55); dcn_smu(4, 800); dcn_smu(6, 782); }
@@ -1973,6 +1993,8 @@ static int hz_switch(int hz, int force)
    wr_abs(0x55e1, 3); wr_abs(0x55f4, 0x0101ff10);
    vb_tx(0x01, 0, 4, symclk, 0x00, 0xf4);                         // TRANSMITTER ENABLE at the new rate
    { const uint8_t d0 = 1; dpcd_write(0x600, &d0, 1); usleep(1000); }
+   usleep(100000);                                                // the firmware's HPD handling (if any) is over
+   dmub_trace("100 ms after TRANSMITTER ENABLE (code 3a: the firmware re-enables the PHY, p0 = its symclk)", 60);
    hz_sink("after TRANSMITTER ENABLE, sink D0");
    { const uint8_t one = 1, zero = 0, ss = 0x10, lc = 0x84; dpcd_write(0x10a, &one, 1); dpcd_write(0x102, &zero, 1);
      dpcd_write(0x108, &one, 1); dpcd_write(0x107, &ss, 1); dpcd_write(0x101, &lc, 1); dpcd_write(0x100, &zero, 1); }
