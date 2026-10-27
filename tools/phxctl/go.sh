@@ -48,6 +48,15 @@ if [ -n "$changed" ] || [ -n "$OFF" ]; then
     # the boot daemon's files only matter at the next boot: a reboot is needed now only when the GPU was off
     [ -n "$OFF" ] && need_reboot "the kill switch was set (the GPU is off this boot)"
 else say "boot daemon is this folder's"; fi
+# 5. 120 Hz at boot ($G/phxboot-120, phxboot switches the panel before WindowServer opens it): turned on once for a round
+# whose folder has the file HZ120; phxboot removes it after a failed switch, and go.sh does not put it back that round
+ROUND=$(cat "$HERE/ROUND" 2>/dev/null || echo 0)
+if [ -f "$HERE/HZ120" ] && [ "$(cat $G/.hz120-round 2>/dev/null)" != "$ROUND" ]; then
+    sudo touch $G/phxboot-120 && echo "$ROUND" | sudo tee $G/.hz120-round >/dev/null
+    say "120 Hz at boot: on (sudo rm $G/phxboot-120 turns it off)"
+fi
+HZNOW=$(ioreg -rc PhxAMDFB -d1 | sed -n 's/.*"PhxFBRefreshMilliHz" = \([0-9]*\).*/\1/p' | head -1)
+[ -e $G/phxboot-120 ] && [ "${HZNOW:-0}" != 120000 ] && need_reboot "120 Hz at boot is on, the panel runs at ${HZNOW:-?} mHz this boot"
 ioreg -rc NMXAccel -d0 | grep -q NMXAccel || need_reboot "the GPU is not up this boot (/var/log/phxboot.log: $(tail -1 /var/log/phxboot.log))"
 
 # phxboot is through its bring-up and WindowServer watch once its mark is gone, and through the SDMA minute once that
@@ -66,7 +75,7 @@ if [ -n "$REBOOT" ]; then
     exit 0
 fi
 
-# 5. everything here runs: wait for this boot's phxboot (SDMA comes on at its end, ~2.5 min after boot), then the tests
+# 6. everything here runs: wait for this boot's phxboot (SDMA comes on at its end, ~2.5 min after boot), then the tests
 wait_phxboot || say "phxboot has not finished in 5 min: testing anyway"
 say "phxboot: $(grep -E '^(SDMA:|frames copied|done)' /var/log/phxboot.log | tail -2 | tr '\n' ' ')"
 [ -f "$HERE/NOTE" ] && { echo; cat "$HERE/NOTE"; echo; }

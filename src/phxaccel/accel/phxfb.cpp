@@ -61,7 +61,15 @@ SYSCTL_INT(_debug, OID_AUTO, phxfb_vbl_staged, CTLFLAG_RW | CTLFLAG_LOCKED, &gVb
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblN, "VBL ticks fired");
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_sum, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsSum, "microseconds the VBL ticks fired past their deadlines, summed");
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsMax, "the latest VBL tick, microseconds past its deadline (writable: 0 restarts it)");
-static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_mbps_bar, &sysctl__debug_phxfb_mbps_wc,
+// debug.phxfb_remeasure: the panel's refresh measured again (write 1), what PhxAMDFB reports (read, mHz). The boot daemon
+// switches the 880M's panel to 120 Hz (mesboot hz 120) while PhxAMDFB holds WindowServer back, then has it measured
+// again: the mode, the VBL tick and the AGDC's panel timing say 120 Hz before WindowServer opens the panel.
+class PhxAMDFB;
+static PhxAMDFB *gPhxFb;
+static int phxfb_remeasure_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, phxfb_remeasure, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, NULL, 0, phxfb_remeasure_sysctl, "I",
+            "write 1 = measure the panel's refresh again (mode, VBL tick, AGDC timing follow); reads the refresh reported, mHz");
+static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_remeasure, &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_mbps_bar, &sysctl__debug_phxfb_mbps_wc,
                                               &sysctl__debug_phxfb_mbps_wb, &sysctl__debug_phxfb_alias_view,
                                               &sysctl__debug_phxfb_vbl_staged, &sysctl__debug_phxfb_vbl_n,
                                               &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max };
@@ -294,6 +302,13 @@ class PhxAMDFB : public IOFramebuffer {
     }
 
 public:
+    uint32_t refreshMilliHz() const { return fRefreshMilliHz; }
+    void remeasure() {
+        measureRefresh();
+        setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
+        if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }
+        nanoseconds_to_absolutetime(fFrameNs, &gPhxFrameAbs);   // the VBL tick takes fFrameNs at its next firing
+    }
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     IOReturn enableController() override { return kIOReturnSuccess; }
@@ -556,6 +571,18 @@ public:
 
 OSDefineMetaClassAndStructors(PhxAMDFB, IOFramebuffer)
 
+static int phxfb_remeasure_sysctl SYSCTL_HANDLER_ARGS
+{
+    PhxAMDFB *fb = gPhxFb;
+    int v = fb ? (int)fb->refreshMilliHz() : 0;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (!fb) return ENXIO;
+    if (v != 1) return EINVAL;
+    fb->remeasure();
+    return 0;
+}
+
 // One boot per arming: `nvram phxfb-boot=1` lets the next start take the panel, and start removes the variable and
 // commits NVRAM at once, so a boot that panics after this point comes back on the firmware framebuffer without hands.
 static bool takeBootArming()
@@ -656,6 +683,7 @@ bool PhxAMDFB::start(IOService *provider)
     setProperty("built-in", kOSBooleanTrue);
     setProperty("PhxFBWidth", fWidth, 32); setProperty("PhxFBHeight", fHeight, 32);   // the AGDC's panel timing reads these
     measureRefresh();
+    gPhxFb = this;
     setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
     if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }   // the AGDC's panel timing
     nanoseconds_to_absolutetime(fFrameNs, &gPhxFrameAbs);
@@ -677,6 +705,7 @@ bool PhxAMDFB::start(IOService *provider)
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (gPhxFb == this) gPhxFb = nullptr;
     if (fBringup) {   // the firmware's frame back on the panel
         const OSSymbol *sym = OSSymbol::withCStringNoCopy("phxScanoutRelease");
         if (sym) { fBringup->callPlatformFunction(sym, false, nullptr, nullptr, nullptr, nullptr); sym->release(); }

@@ -42,6 +42,10 @@ if [ -e "$OFF" ]; then echo "kill switch present: nothing to do"; release; exit 
 # The boot before turned SDMA copies on (as WindowServer got the panel) and never got a minute past it: the hang is put
 # on SDMA alone - SDMA copies off, the bring-up mark cleared so no kill switch, WindowServer stays on the GPU (build 38
 # hung WindowServer's display pipe that way, 2026-10-26 22:11)
+if [ -e $G/hz120.pending ]; then
+    echo "the last boot did not get through the switch to 120 Hz: 120 Hz at boot off ($G/phxboot-120 removed)"
+    rm -f $G/hz120.pending $G/phxboot-120 "$MARK"; sync
+fi
 if [ -e $G/gpucopy.pending ]; then
     echo "the last boot hung within a minute of turning SDMA copies on: SDMA copies off ($G/phxboot-gpucopy removed)"
     rm -f $G/gpucopy.pending $G/phxboot-gpucopy "$MARK"; sync
@@ -62,7 +66,7 @@ touch "$MARK"; sync
 # An orderly shutdown (launchd's SIGTERM) is not a hang: drop the marks, so a reboot asked for during the bring-up or the
 # watches does not set the kill switch at the next boot (go.sh rebooted 23:23 mid-watch, 2026-10-26). A real hang or a
 # forced power-off sends nothing and leaves them.
-trap 'echo "$(date "+%T") shutdown: marks cleared"; rm -f "$MARK" $G/gpucopy.pending; sync; exit 0' TERM
+trap 'echo "$(date "+%T") shutdown: marks cleared"; rm -f "$MARK" $G/gpucopy.pending $G/hz120.pending; sync; exit 0' TERM
 apps_only
 MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt"
 $G/phxctl/mesboot claim
@@ -84,6 +88,27 @@ if [ $M2 = 1 ]; then
     # and then a skipped one (2026-10-21)
     sysctl -w debug.nvaccel_iop_vsync=1 >/dev/null 2>&1
     all_apps "; WindowServer composites on the GPU (armed only)" '!WindowServer'
+    # 120 Hz ($G/phxboot-120): the panel switched while WindowServer is still held back (mesboot hz 120: the link
+    # retrained at 8.1 Gb/s through DMCUB, 2026-10-27), then PhxAMDFB measures it again, so the mode and its VBL tick say
+    # 120 Hz when WindowServer opens the panel. Failed: back to 60 Hz and 120 Hz off at boot; the way back failed too
+    # (the panel dark): reboot - the firmware lights it at 60 Hz. $G/hz120.pending stays until WindowServer's 90 s watch
+    # below is over: a hang, or the power button held on a dark panel, turns 120 Hz off for the next boot.
+    if [ -e $G/phxboot-120 ]; then
+        mkdir -p $G/logs; touch $G/hz120.pending; sync
+        HZ_QUIET=1 $G/phxctl/mesboot hz 120 > $G/logs/hz120-boot.txt 2>&1; rc=$?
+        if [ $rc = 0 ]; then
+            sysctl -w debug.phxfb_remeasure=1 >/dev/null 2>&1
+            echo "panel at 120 Hz ($(grep '^hz: done' $G/logs/hz120-boot.txt | cut -c5-)); PhxAMDFB reports $(sysctl -n debug.phxfb_remeasure 2>/dev/null) mHz"
+        else
+            echo "120 Hz did not come up (rc $rc, $G/logs/hz120-boot.txt): back to 60 Hz, 120 Hz at boot off"
+            rm -f $G/phxboot-120
+            HZ_QUIET=1 $G/phxctl/mesboot hz 60 >> $G/logs/hz120-boot.txt 2>&1; rc=$?
+            sysctl -w debug.phxfb_remeasure=1 >/dev/null 2>&1
+            if [ $rc != 0 ]; then
+                echo "back to 60 Hz failed too (rc $rc): rebooting"; rm -f $G/hz120.pending "$MARK"; sync; shutdown -r now; exit 0
+            fi
+        fi
+    fi
     # WindowServer's process starts early but opens the panel only once GPUWrangler publishes the GPU, which the busy
     # hold delays. A panel opened before the arming (the hold timed out) stays black, and a restarted WindowServer then
     # asserts in CoreDisplay_CreateDisplayForCGXDisplayDevice and hangs: no way back but a reboot.
@@ -109,6 +134,7 @@ if [ $M2 = 1 ]; then
     done
     pgrep -qx WindowServer || m2_fail "no WindowServer"
     echo "WindowServer pid $(pgrep -x WindowServer), frames on the panel $(sysctl -n debug.nvaccel_iop_ok)"
+    rm -f $G/hz120.pending; sync
 else
     release
     # Strix Point is new: Metal for the test tools only until the user opts every app in with $G/phxboot-apps
