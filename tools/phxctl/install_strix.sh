@@ -1,5 +1,5 @@
 #!/bin/bash
-# Обновляет утилиты и скрипты в ~/gpu (прошивки в ~/gpu/fw не трогает). Запускать без sudo.
+# Обновляет утилиты и скрипты в ~/gpu; прошивки в ~/gpu/fw - только если они есть в пакете (gpu/fw, релиз). Без sudo.
 # Старые try1..try14 (каждый делал свой bring-up) переезжают в ~/gpu/old.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -16,6 +16,7 @@ cp "$HERE"/gpu/*.sh ~/gpu/
 cp "$HERE"/gpu/*.txt ~/gpu/ 2>/dev/null || true
 cp "$HERE"/gpu/phxctl/* ~/gpu/phxctl/
 [ -d "$HERE/gpu/nvmtl" ] && cp "$HERE"/gpu/nvmtl/* ~/gpu/nvmtl/
+ls "$HERE"/gpu/fw/*.bin >/dev/null 2>&1 && cp "$HERE"/gpu/fw/*.bin ~/gpu/fw/
 mkdir -p ~/gpu/metal && [ -f "$HERE/metal/mtlprobe" ] && cp "$HERE/metal/mtlprobe" ~/gpu/metal/ && chmod +x ~/gpu/metal/mtlprobe
 [ -f "$HERE/metal/fpsanim" ] && cp "$HERE/metal/fpsanim" ~/gpu/metal/ && chmod +x ~/gpu/metal/fpsanim
 xattr -dr com.apple.quarantine ~/gpu 2>/dev/null || true
