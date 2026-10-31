@@ -60,6 +60,9 @@ enum {
     PHXN_SEL_DBG_VRAM_WRITE = 109, /* in: [0] VRAM byte offset (dword-aligned) [1] dword value; writes via BAR0. */
     PHXN_SEL_DBG_ADOPTQ = 112,     /* in: [0] ring VRAM off [1] ring dwords [2] wb VRAM off (wptr shadow at +16) [3] doorbell byte off [4] wptr [5] fence VRAM off | queue (0 compute, 1 gfx) */
     PHXN_SEL_DBG_CLAIM = 113,      /* in: [0] 1 = mark the GPU driven (nmxgpu-claimed) and re-run matching so PhxAccel starts. */
+    PHXN_SEL_DBG_ADOPTVCN = 114,   /* build 42+, Strix Point: in: [0] VCN unified ring VRAM off (0 = give it back, once idle)
+                                      [1] ring dwords [2] fence VRAM off [3] write pointer (dwords) [4] VCN firmware version.
+                                      The ring is the one `mesboot vcn up` started; AMDGPU_HW_IP_VCN_ENC submits run on it. */
     PHXN_SEL_DBG_SYSMEM = 111,     /* in: [0] op (1 alloc [1] bytes, 2 read [1] off, 3 write [1] off [2] val, 4 free)  out: [0] phys  [1] len/value */
     PHXN_SEL_DBG_DOORBELL = 110,   /* in: [0] doorbell BAR2 byte offset (8-aligned) [1] value lo [2] value hi; writes a 64-bit doorbell. */
 };
@@ -133,6 +136,7 @@ enum {
 #define PHXN_INFO_HUNG         (1u << 0)
 #define PHXN_INFO_S1B_POSITIVE (1u << 1)
 #define PHXN_INFO_NATIVE_BOOT  (1u << 2)
+#define PHXN_INFO_VCN          (1u << 3)   /* build 42: VCN 4.0.5 adopted; reserved[0] = its firmware version */
 
 /* BoCreate scalar out [3] */
 #define PHXN_PLACED_CPU_MAPPABLE (1u << 0)
@@ -160,6 +164,7 @@ enum {
 #define PHX_AMDGPU_CTX_OP_QUERY_STATE2 4u
 #define PHX_AMDGPU_HW_IP_GFX 0u
 #define PHX_AMDGPU_HW_IP_COMPUTE 1u
+#define PHX_AMDGPU_HW_IP_VCN_ENC 7u   /* amdgpu_drm.h AMDGPU_HW_IP_VCN_ENC: VCN 4's unified queue (4 is VCE: build 42 had it wrong) */
 #define PHX_AMDGPU_IB_FLAG_CE                     (1u << 0)
 #define PHX_AMDGPU_IB_FLAG_PREAMBLE               (1u << 1)
 #define PHX_AMDGPU_IB_FLAG_PREEMPT                (1u << 2)

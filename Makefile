@@ -10,6 +10,7 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_rdna3_ucode \
         $(TEST_BIN_DIR)/test_r3n_abi \
         $(TEST_BIN_DIR)/test_rdna3_chip \
+        $(TEST_BIN_DIR)/test_vcn \
         $(TEST_BIN_DIR)/fwplan
 
 .PHONY: all test clean kext fixtures
@@ -34,6 +35,9 @@ $(TEST_BIN_DIR)/test_r3n_abi: src/uapi/r3n_user_client.cpp src/winsys/radv_r3n_w
 $(TEST_BIN_DIR)/test_rdna3_chip: tests/test_rdna3_chip.cpp src/amd/rdna3_chip.h tests/test_rdna3_chip_c.c | $(TEST_BIN_DIR)
 	$(CC) -std=c99 -Wall -Wextra -Werror -Isrc/amd -c tests/test_rdna3_chip_c.c -o $(TEST_BIN_DIR)/test_rdna3_chip_c.o
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_rdna3_chip.cpp $(TEST_BIN_DIR)/test_rdna3_chip_c.o -o $@
+
+$(TEST_BIN_DIR)/test_vcn: tests/test_vcn.c src/amd/vcn_v4_0_5.h src/amd/vcn_regs_strix.h src/phxbringup/PhxNativeABI.h | $(TEST_BIN_DIR)
+	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc/amd -Isrc/phxbringup tests/test_vcn.c -o $@
 
 # fwplan is a tool, not a test: built here so CI compiles it; `test` runs it on the Strix Point fixtures
 $(TEST_BIN_DIR)/fwplan: tools/fwplan/fwplan.cpp src/amd/rdna3_ucode_extract.cpp | $(TEST_BIN_DIR)
