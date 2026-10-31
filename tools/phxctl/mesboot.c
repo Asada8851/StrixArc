@@ -2031,6 +2031,8 @@ static int hz_switch(int hz, int force)
    return trained == 0 ? 0 : trained == -3 ? 4 : trained == -4 ? 5 : 3;
 }
 
+#include "mesboot_vcn.inc"
+
 // mesboot dpcd r <addr> <len> | dpcd w <addr> <hex bytes> | dmub <hex bytes of one command> | dmubstate | dmubtrace [n]
 // | hz 60|120 [again]
 static int link_cmd(int argc, char **argv)
@@ -2089,6 +2091,7 @@ int main(int argc, char **argv)
    if (argc < 2) { fprintf(stderr, "mesboot gart|mes|kiqsched|gpustat|claim|gfx|all ...\n"); return 2; }
    if (strcmp(argv[1], "gpustat") && strcmp(argv[1], "dump") && strcmp(argv[1], "claim") && strcmp(argv[1], "dcnflip") &&
        strcmp(argv[1], "sdmatest") && strcmp(argv[1], "dpcd") && strcmp(argv[1], "dmub") && strcmp(argv[1], "dmubstate") && strcmp(argv[1], "dmubtrace") && strcmp(argv[1], "hz") &&
+       strcmp(argv[1], "vcn") &&
        accel_running() &&
        !(getenv("MESBOOT_FORCE") && *getenv("MESBOOT_FORCE") == '1')) {
       fprintf(stderr, "mesboot: STOP: the Metal accelerator (NMXAccel) already runs on the GPU, so this boot's bring-up "
@@ -2101,6 +2104,8 @@ int main(int argc, char **argv)
       if (!off) { fprintf(stderr, "mesboot: GCMC_VM_FB_OFFSET reads 0, GPU not up?\n"); return 1; }
       fb_pa = (uint64_t)off << 24;
    }
+   // VCN and MMHUB only: neither the GC hub's tables nor any queue NMXAccel's clients use
+   if (!strcmp(argv[1], "vcn")) return vcn_cmd(argc, argv);
    int all = !strcmp(argv[1], "all");
    if (getenv("MESBOOT_MC") && *getenv("MESBOOT_MC") == '1') use_mc = 1;
    if (!strcmp(argv[1], "db") && argc >= 4) { printf("db +0x%llx <- %llu kr=0x%x\n", strtoull(argv[2], NULL, 0), strtoull(argv[3], NULL, 0), db(strtoull(argv[2], NULL, 0), strtoull(argv[3], NULL, 0))); return 0; }
