@@ -38,7 +38,8 @@ while [ "${1:-}" = -n ] || [ "${1:-}" = -v ]; do [ "$1" = -v ] && exit 0; shift;
 EOF
 cat > ioreg <<'EOF'
 #!/bin/bash
-case "$*" in *NMXAccel*) echo '+-o NMXAccel  <class NMXAccel>';; *PhxBringup*) echo '  "phx-build" = 43';; esac
+case "$*" in *NMXAccel*) echo '+-o NMXAccel  <class NMXAccel>';;
+  *PhxBringup*) echo '  "phx-build" = 44'; [ -n "${FAKE_VCN_HELD:-}" ] && echo '  "phx-vcn" = 1';; esac
 EOF
 printf '#!/bin/bash\necho 15.8.1\n' > sw_vers
 printf '#!/bin/bash\nexit 0\n' > codesign; cp codesign xattr
@@ -102,6 +103,16 @@ check "perf: 4 ffplay runs sampled (ffplay itself)" "[ \$(grep -c 'sample: Sampl
 check "perf: VCN runs show NV12, CPU run IYUV" "grep -q 'ffplay vcn: exit 0, texture NV12' $B/out.txt && grep -q 'ffplay vcn-import: exit 0, texture NV12' $B/out.txt && grep -q 'ffplay cpu: exit 0, texture IYUV' $B/out.txt"
 check "perf: flush counts per step" "[ \$(grep -c 'MMHUB flushes' $B/out.txt) -ge 8 ]"
 check "perf: VCN released and down" "echo '$MB' | grep -q 'release;vcn down;'"
+
+echo "## shared"
+run "$B/s1" shared
+grep -E '^   ' "$B/out.txt"
+check "shared: both clips on VCN (NV12), nothing dropped" "grep -q 'ffplay shared-hevc: exit 0, texture NV12, dropped 0' $B/out.txt && grep -q 'ffplay shared-user_av: exit 0, texture NV12, dropped 0' $B/out.txt"
+check "shared: the RADV files compared, VCN released" "grep -q 'the plugin opened' $B/out.txt && echo '$MB' | grep -q 'release;vcn down;'"
+
+echo "## VCN held by PhxBringup since boot (phxboot-vcn)"
+FAKE_VCN_HELD=1 run "$B/s1" play "$CLIPS/user_noaudio.mp4" -t 3
+check "held at boot: no up/adopt/release/down, played on VCN" "grep -q 'VCN is up since boot and held by PhxBringup' $B/out.txt && echo '$MB' | grep -qx 'vcn status;' && grep -q 'ffplay play: exit 0, texture NV12' $B/out.txt"
 
 echo "## a Linux reference that differs"
 sed -i '5s/^./0/' "$B/s1/nullarc/video/ref/h264_1080.md5"; run "$B/s1"
