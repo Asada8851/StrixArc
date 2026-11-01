@@ -6,6 +6,9 @@
 # turns itself off and leaves PhxAMDFB off (the marker survives a hang); WindowServer crashing 3 times in 90 s is taken
 # off the GPU; NVRAM phxfb-boot is armed again only after a good M2 boot and only while $G/phxboot-m2 exists.
 # Kill switch: the file $G/phxboot-off.
+# A new RADV (update_radv.sh leaves $G/radv.pending) is kept only once WindowServer got through its watch on it; a boot
+# on it that does not puts the previous one back. VCN at boot ($G/phxboot-vcn): up and handed to PhxBringup after the
+# watch; a boot that hangs in it turns it off for the next ones.
 G=/Users/Shared/gpu; export HOME=/Users/Shared
 LOG=/var/log/phxboot.log; MARK=/var/db/phxboot.pending; OFF=$G/phxboot-off
 ALLOW=/Library/GPUBundles/nvmtl-allow.txt; DR=/Library/Logs/DiagnosticReports
@@ -18,6 +21,19 @@ echo "== $(date '+%F %T') phxboot"
 [ -f $G/nullarc_logs.sh ] && ( sleep 100; NULLARC_LOGS_DEST=$G/logs bash $G/nullarc_logs.sh atboot
     ls -1dt $G/logs/*-atboot 2>/dev/null | tail -n +7 | while IFS= read -r d; do rm -rf "$d"; done ) >/dev/null 2>&1 &
 release() { sysctl -w debug.phxfb_hold=0 >/dev/null 2>&1; }
+# $G/radv.pending: line 1 "new" (installed, not yet run by WindowServer) or "tried" (this or the last boot runs it),
+# line 2 the previous RADV's copy. radv_back puts that copy back.
+RADV=/Library/GPUBundles/nvmtl/libvulkan_radeon.dylib
+radv_state() { head -1 $G/radv.pending 2>/dev/null; }
+radv_set() { { echo "$1"; sed -n 2p $G/radv.pending; } > $G/radv.pending.new && mv $G/radv.pending.new $G/radv.pending; sync; }
+radv_back() {
+    local bk; bk=$(sed -n 2p $G/radv.pending 2>/dev/null)
+    if [ -f "$bk" ] && cp "$bk" "$RADV"; then
+        codesign --force --sign - "$RADV" >/dev/null 2>&1; chown root:wheel "$RADV"; chmod 755 "$RADV"
+        echo "previous RADV back from $bk"
+    else echo "!! no copy of the previous RADV at '$bk': the new one stays (sudo bash ~/gpu/update_radv.sh --undo)"; fi
+    rm -f $G/radv.pending; sync
+}
 apps_only() { printf '# phxboot: Metal for the built-in test tools only\n' > $ALLOW; }
 # every process gets the Metal device; WindowServer too once the accelerator is armed (NullMoth's own default list).
 # Denied ("-name", before "*"): the background neural-network users. mediaanalysisd (Photos analysis, which starts by
@@ -31,6 +47,10 @@ all_apps() { { printf '# phxboot: Metal for every app%s\n' "$1"; for d in $DENY;
 # PhxAMDFB without the arming leaves the panel black: give up on M2 (until $G/phxboot-m2 is put back) and reboot into
 # the firmware framebuffer
 m2_fail() {
+    if [ "$(radv_state)" = tried ]; then
+        echo "M2 failed ($1) on a new RADV: the previous RADV back, M2 kept, rebooting"
+        radv_back; rm -f "$MARK" $G/hz120.pending; [ -e $G/phxboot-m2 ] && nvram phxfb-boot=1; sync; shutdown -r now; exit 0
+    fi
     echo "M2 failed ($1): PhxAMDFB off, rebooting"
     apps_only; sysctl -w debug.phxagdc=0 >/dev/null 2>&1
     nvram -d phxfb-boot; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
@@ -50,6 +70,16 @@ if [ -e $G/gpucopy.pending ]; then
     echo "the last boot hung within a minute of turning SDMA copies on: SDMA copies off ($G/phxboot-gpucopy removed)"
     rm -f $G/gpucopy.pending $G/phxboot-gpucopy "$MARK"; sync
 fi
+if [ -e $G/vcn.pending ]; then
+    echo "the last boot hung within 20 s of bringing VCN up: VCN at boot off ($G/phxboot-vcn removed)"
+    rm -f $G/vcn.pending $G/phxboot-vcn "$MARK"; sync
+fi
+# a boot already ran WindowServer on the new RADV and ended before its watch passed (a hang, the power button): the RADV
+# is the suspect, the previous one goes back before WindowServer loads the plugin (no kill switch for it)
+if [ "$(radv_state)" = tried ]; then
+    echo "the last boot on the new RADV did not get WindowServer through its watch"
+    radv_back; rm -f "$MARK"; sync
+fi
 if [ -e "$MARK" ]; then
     echo "previous attempt did not finish: phxboot and PhxAMDFB off"
     touch "$OFF"; rm -f "$MARK"; nvram -d phxfb-boot; sync
@@ -66,7 +96,10 @@ touch "$MARK"; sync
 # An orderly shutdown (launchd's SIGTERM) is not a hang: drop the marks, so a reboot asked for during the bring-up or the
 # watches does not set the kill switch at the next boot (go.sh rebooted 23:23 mid-watch, 2026-10-26). A real hang or a
 # forced power-off sends nothing and leaves them.
-trap 'echo "$(date "+%T") shutdown: marks cleared"; rm -f "$MARK" $G/gpucopy.pending $G/hz120.pending; sync; exit 0' TERM
+trap 'echo "$(date "+%T") shutdown: marks cleared"; rm -f "$MARK" $G/gpucopy.pending $G/hz120.pending $G/vcn.pending
+      [ "$(radv_state)" = tried ] && radv_set new; sync; exit 0' TERM
+# a new RADV is on trial from here: WindowServer gets it with the arming below
+[ "$(radv_state)" = new ] && radv_set tried && echo "new RADV on trial this boot (kept once WindowServer is through its watch)"
 apps_only
 MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt"
 $G/phxctl/mesboot claim
@@ -135,13 +168,31 @@ if [ $M2 = 1 ]; then
     pgrep -qx WindowServer || m2_fail "no WindowServer"
     echo "WindowServer pid $(pgrep -x WindowServer), frames on the panel $(sysctl -n debug.nvaccel_iop_ok)"
     rm -f $G/hz120.pending; sync
+    [ -e $G/radv.pending ] && { rm -f $G/radv.pending; sync; echo "the new RADV kept: WindowServer got through its watch on it"; }
 else
     release
+    # no WindowServer on the GPU: nothing tells about a new RADV this boot, it waits for one that has
+    [ "$(radv_state)" = tried ] && radv_set new
     # Strix Point is new: Metal for the test tools only until the user opts every app in with $G/phxboot-apps
     if [ "$CHIP" = strix-point ] && [ ! -e $G/phxboot-apps ]; then
         apps_only; echo "Strix Point: Metal for the test tools only (touch $G/phxboot-apps for every app)"
     else
         all_apps " (WindowServer stays on the firmware framebuffer)" ""
+    fi
+fi
+# VCN at boot ($G/phxboot-vcn): up and handed to PhxBringup once WindowServer is through its watch, the firmware from
+# $G/fw; clients (ffplay, vplay) decode on it from then on. Failed: VCN down again, the desktop as before.
+# $G/vcn.pending stays for 20 s: a hang in there turns VCN at boot off at the next boot.
+if [ -e $G/phxboot-vcn ]; then
+    VF=$G/fw/vcn_4_0_5.bin; mkdir -p $G/logs; VL=$G/logs/vcn-boot.txt
+    if [ ! -f $VF ]; then echo "VCN at boot: no $VF"
+    else
+        touch $G/vcn.pending; sync
+        { $G/phxctl/mesboot vcn up $VF && $G/phxctl/mesboot vcn ringtest 3 && $G/phxctl/mesboot vcn adopt $VF; } > $VL 2>&1; rc=$?
+        if [ $rc = 0 ] && ioreg -rc PhxBringup -d1 | grep -q '"phx-vcn" = 1'; then echo "VCN up and handed to PhxBringup: video decode for clients"
+        else echo "VCN at boot failed (rc $rc, $VL): VCN down, VCN at boot off ($G/phxboot-vcn removed)"
+             $G/phxctl/mesboot vcn down >> $VL 2>&1; rm -f $G/phxboot-vcn; fi
+        ( sleep 20; rm -f $G/vcn.pending; sync ) &
     fi
 fi
 [ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && echo "PhxAMDFB armed for the next boot"

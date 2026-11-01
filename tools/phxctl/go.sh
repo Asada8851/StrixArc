@@ -45,6 +45,28 @@ if [ -f "$HERE/metal/NVMTLDriver" ] && [ -f "$HERE/update_plugin.sh" ]; then
         else say "STOP: update_plugin.sh failed (above)"; exit 1; fi
     else say "Metal plugin is this folder's build"; fi
 fi
+# 3c. the RADV the plugin runs on (gpu/nvmtl): on trial at the next boot, phxboot keeps it or puts the previous one back;
+# the installed copy is re-signed, so the package's checksum is kept in $G/.radv-installed
+if [ -f "$HERE/gpu/nvmtl/libvulkan_radeon.dylib" ] && [ -f "$HERE/gpu/update_radv.sh" ]; then
+    RSUM=$(shasum "$HERE/gpu/nvmtl/libvulkan_radeon.dylib" | cut -d' ' -f1)
+    if [ "$(cat $G/.radv-installed 2>/dev/null)" != "$RSUM" ]; then
+        say "RADV: installing this folder's build"
+        sudo bash "$HERE/gpu/update_radv.sh" | tail -2
+        if [ "${PIPESTATUS[0]}" = 0 ] && echo "$RSUM" | sudo tee $G/.radv-installed >/dev/null; then need_reboot "RADV updated (WindowServer loads it at boot)"
+        else say "STOP: update_radv.sh failed (above)"; exit 1; fi
+    else say "RADV is this folder's build$([ -e $G/radv.pending ] && echo ', on trial until WindowServer'"'"'s watch passes')"; fi
+fi
+# 3d. the everyday player (gpu/ffmpeg, vplay, VCN Player.app): no reboot; the checksum of ffplay + vplay kept in
+# $G/.player-installed
+if [ -f "$HERE/gpu/ffmpeg/bin/ffplay" ] && [ -f "$HERE/gpu/install_player.sh" ]; then
+    PLSUM=$(cat "$HERE/gpu/ffmpeg/bin/ffplay" "$HERE/gpu/vplay" "$HERE/gpu/ffmpeg/lib/libavcodec.62.dylib" 2>/dev/null | shasum | cut -d' ' -f1)
+    if [ "$(cat $G/.player-installed 2>/dev/null)" != "$PLSUM" ]; then
+        say "player: installing this folder's ffplay, vplay and VCN Player.app"
+        sudo bash "$HERE/gpu/install_player.sh" | tail -2
+        if [ "${PIPESTATUS[0]}" = 0 ]; then echo "$PLSUM" | sudo tee $G/.player-installed >/dev/null
+        else say "STOP: install_player.sh failed (above)"; exit 1; fi
+    else say "player is this folder's build"; fi
+fi
 # 4. the boot daemon and the scripts it runs; also the way back from phxboot's kill switch
 changed=""
 for f in phxboot.sh full.sh bringup5.sh nullarc_logs.sh; do cmp -s "$HERE/gpu/$f" "$G/$f" || changed="$changed $f"; done
@@ -65,6 +87,15 @@ if [ -f "$HERE/HZ120" ] && [ "$(cat $G/.hz120-round 2>/dev/null)" != "$ROUND" ];
     sudo touch $G/phxboot-120 && echo "$ROUND" | sudo tee $G/.hz120-round >/dev/null
     say "120 Hz at boot: on (sudo rm $G/phxboot-120 turns it off)"
 fi
+# 5b. VCN at boot ($G/phxboot-vcn): turned on once for a round whose folder has the file VCNBOOT; phxboot removes it
+# after a boot that hung bringing VCN up, and go.sh does not put it back that round
+if [ -f "$HERE/VCNBOOT" ] && [ "$(cat $G/.vcnboot-round 2>/dev/null)" != "$ROUND" ]; then
+    sudo touch $G/phxboot-vcn && echo "$ROUND" | sudo tee $G/.vcnboot-round >/dev/null
+    say "VCN at boot: on (sudo rm $G/phxboot-vcn turns it off)"
+fi
+# (phxboot brings VCN up at its end, after WindowServer's watch: judged only once its mark is gone)
+[ -e $G/phxboot-vcn ] && [ ! -e /var/db/phxboot.pending ] && ! ioreg -rc PhxBringup -d1 | grep -q '"phx-vcn" = 1' &&
+    need_reboot "VCN at boot is on, VCN is not up this boot (/Users/Shared/gpu/logs/vcn-boot.txt)"
 HZNOW=$(ioreg -rc PhxAMDFB -d1 | sed -n 's/.*"PhxFBRefreshMilliHz" = \([0-9]*\).*/\1/p' | head -1)
 [ -e $G/phxboot-120 ] && [ "${HZNOW:-0}" != 120000 ] && need_reboot "120 Hz at boot is on, the panel runs at ${HZNOW:-?} mHz this boot"
 ioreg -rc NMXAccel -d0 | grep -q NMXAccel || need_reboot "the GPU is not up this boot (/var/log/phxboot.log: $(tail -1 /var/log/phxboot.log))"
