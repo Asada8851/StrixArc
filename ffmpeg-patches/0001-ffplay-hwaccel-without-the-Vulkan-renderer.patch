@@ -1,0 +1,110 @@
+ffplay: hardware decoding without the Vulkan renderer, frames copied to memory
+
+ffplay 8.1 takes -hwaccel only together with its Vulkan renderer (libplacebo, a Vulkan surface for the window). On
+macOS with StrixArc's RADV there is neither: RADV decodes on VCN but cannot present to a Cocoa window. Without the
+renderer the decoder now gets a device of its own (as ffmpeg's -hwaccel does) and every decoded frame is copied to
+memory (av_hwframe_transfer_data) for the SDL renderer, as mpv's *-copy hwdecs do. NV12, what hardware decoders hand
+over, goes straight into an SDL NV12 texture (SDL 2.0.16+) instead of through swscale to YUV420P.
+-hwaccel_opts passes options to that device, e.g. avoid_host_import=1: copies through FFmpeg's pooled staging buffers
+instead of importing each frame's memory, which costs a kernel round trip per frame on some drivers (StrixArc's).
+
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -354,6 +354,7 @@
+ static char *vulkan_params = NULL;
+ static char *video_background = NULL;
+ static const char *hwaccel = NULL;
++static const char *hwaccel_opts = NULL;
+ 
+ /* current context */
+ static int is_full_screen;
+@@ -389,6 +390,10 @@
+     { AV_PIX_FMT_BGR32,          SDL_PIXELFORMAT_ABGR8888 },
+     { AV_PIX_FMT_BGR32_1,        SDL_PIXELFORMAT_BGRA8888 },
+     { AV_PIX_FMT_YUV420P,        SDL_PIXELFORMAT_IYUV },
++#if SDL_VERSION_ATLEAST(2,0,16)
++    /* what hardware decoders hand over (copied to memory): straight into the texture, not through swscale */
++    { AV_PIX_FMT_NV12,           SDL_PIXELFORMAT_NV12 },
++#endif
+     { AV_PIX_FMT_YUYV422,        SDL_PIXELFORMAT_YUY2 },
+     { AV_PIX_FMT_UYVY422,        SDL_PIXELFORMAT_UYVY },
+ };
+@@ -928,6 +933,15 @@
+                 return -1;
+             }
+             break;
++#if SDL_VERSION_ATLEAST(2,0,16)
++        case SDL_PIXELFORMAT_NV12:
++            if (frame->linesize[0] <= 0 || frame->linesize[1] <= 0) {
++                av_log(NULL, AV_LOG_ERROR, "Negative linesizes are not supported for NV12.\n");
++                return -1;
++            }
++            ret = SDL_UpdateNVTexture(*tex, NULL, frame->data[0], frame->linesize[0], frame->data[1], frame->linesize[1]);
++            break;
++#endif
+         default:
+             if (frame->linesize[0] < 0) {
+                 ret = SDL_UpdateTexture(*tex, NULL, frame->data[0] + frame->linesize[0] * (frame->height - 1), -frame->linesize[0]);
+@@ -954,7 +968,8 @@
+ {
+ #if SDL_VERSION_ATLEAST(2,0,8)
+     SDL_YUV_CONVERSION_MODE mode = SDL_YUV_CONVERSION_AUTOMATIC;
+-    if (frame && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUYV422 || frame->format == AV_PIX_FMT_UYVY422)) {
++    if (frame && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUYV422 || frame->format == AV_PIX_FMT_UYVY422 ||
++                  frame->format == AV_PIX_FMT_NV12)) {
+         if (frame->color_range == AVCOL_RANGE_JPEG)
+             mode = SDL_YUV_CONVERSION_JPEG;
+         else if (frame->colorspace == AVCOL_SPC_BT709)
+@@ -1854,6 +1869,22 @@
+         }
+     }
+ 
++    if (got_picture > 0 && frame->hw_frames_ctx && !vk_renderer) {
++        AVFrame *sw = av_frame_alloc();
++        int ret = sw ? av_hwframe_transfer_data(sw, frame, 0) : AVERROR(ENOMEM);
++
++        if (ret >= 0)
++            ret = av_frame_copy_props(sw, frame);
++        av_frame_unref(frame);
++        if (ret < 0) {
++            av_log(NULL, AV_LOG_ERROR, "Failed to copy a %s frame to memory: %s\n", hwaccel, av_err2str(ret));
++            av_frame_free(&sw);
++            return -1;
++        }
++        av_frame_move_ref(frame, sw);
++        av_frame_free(&sw);
++    }
++
+     return got_picture;
+ }
+ 
+@@ -2664,8 +2695,19 @@
+         return AVERROR(ENOTSUP);
+ 
+     if (!vk_renderer) {
+-        av_log(NULL, AV_LOG_ERROR, "Vulkan renderer is not available\n");
+-        return AVERROR(ENOTSUP);
++        /* no Vulkan renderer (no libplacebo, or no Vulkan surface for the window): decode on the device anyway and
++         * copy every frame to memory for the SDL renderer (get_video_frame) */
++        AVDictionary *dev_opts = NULL;
++
++        av_log(NULL, AV_LOG_INFO, "Decoding on %s without the Vulkan renderer: frames are copied to memory for the SDL renderer\n", hwaccel);
++        if (hwaccel_opts && (ret = av_dict_parse_string(&dev_opts, hwaccel_opts, "=", ",", 0)) < 0) {
++            av_log(NULL, AV_LOG_ERROR, "Bad -hwaccel_opts '%s'\n", hwaccel_opts);
++            av_dict_free(&dev_opts);
++            return ret;
++        }
++        ret = av_hwdevice_ctx_create(device_ctx, type, NULL, dev_opts, 0);
++        av_dict_free(&dev_opts);
++        return ret;
+     }
+ 
+     ret = vk_renderer_get_hw_dev(vk_renderer, &vk_dev);
+@@ -3793,6 +3835,7 @@
+     { "vulkan_params",      OPT_TYPE_STRING, OPT_EXPERT, { &vulkan_params }, "vulkan configuration using a list of key=value pairs separated by ':'" },
+     { "video_bg",           OPT_TYPE_STRING, OPT_EXPERT, { &video_background }, "set video background for transparent videos" },
+     { "hwaccel",            OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel }, "use HW accelerated decoding" },
++    { "hwaccel_opts",       OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel_opts }, "options of the decoding device without the Vulkan renderer (key=value,...)", "options" },
+     { NULL, },
+ };
+ 
