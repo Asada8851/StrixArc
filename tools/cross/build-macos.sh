@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-builds PhxBringup.kext and mesboot for macOS x86_64 on Linux.
+# Cross-builds PhxBringup.kext, PhxAccel.kext, mesboot and the test clients for macOS x86_64 on Linux.
 # usage: tools/cross/build-macos.sh <toolchain env.sh> [out dir]
 #
 # The toolchain env.sh exports PATH/LD_LIBRARY_PATH for clang + ld64.lld, SDKROOT (MacOSX15.5.sdk), MKSDK
@@ -54,4 +54,15 @@ fi
 UCF="-target x86_64-apple-macos12.0 -isysroot $SDKROOT -fuse-ld=lld -Wl,-adhoc_codesign -O2 -Wall"
 clang $UCF -I"$ROOT/src/amd" "$ROOT/tools/phxctl/mesboot.c" -framework IOKit -framework CoreFoundation \
     -o "$OUT/mesboot"
-echo "built: $OUT/PhxBringup.kext $OUT/PhxAccel.kext $OUT/mesboot"
+# test clients: yuvprobe (YUV surfaces through the Metal plugin), vcnjob (VCN jobs through PhxBringup 42+)
+clang $UCF -fobjc-arc "$ROOT/tools/yuvprobe/yuvprobe.m" -framework Foundation -framework Metal -framework CoreVideo \
+    -framework IOSurface -framework CoreMedia -framework AVFoundation -framework VideoToolbox -framework QuartzCore \
+    -framework AppKit -framework CoreAudio -o "$OUT/yuvprobe"
+clang $UCF -I"$ROOT/src/phxbringup" -I"$ROOT/src/amd" "$ROOT/tools/vcnjob/vcnjob.c" -framework IOKit -o "$OUT/vcnjob"
+# vkvideo: RADV's Vulkan Video decode without a loader; the Vulkan headers come from the build host (vulkan-headers),
+# only those two directories, next to the macOS SDK
+VKH=$OBJ/vkinclude; mkdir -p "$VKH"
+for d in vulkan vk_video; do [ -d /usr/include/$d ] && ln -sfn /usr/include/$d "$VKH/$d"; done
+if [ -e "$VKH/vulkan/vulkan.h" ]; then clang $UCF -I"$VKH" "$ROOT/tools/vkvideo/vkvideo.c" -o "$OUT/vkvideo"
+else echo "no /usr/include/vulkan: vkvideo not built"; fi
+echo "built: $OUT/PhxBringup.kext $OUT/PhxAccel.kext $OUT/mesboot $OUT/yuvprobe $OUT/vcnjob $OUT/vkvideo"

@@ -1,0 +1,27 @@
+From f4b54043546691e4ae1a793deafab2aea6aef19f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 18:13:42 +0300
+Subject: [PATCH] radv/darwin: name the strix1 device Radeon 880M/890M
+
+Without it a Strix Point machine showed the RX 9070 XT name of the gfx1201 default. The RADV the
+880M has run since 2026-10-25 was built with this change; it was never written down as a patch.
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 0793347..7eefa31 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -370,6 +370,8 @@ acd_get_marketing_name(acd_device_handle dev)
+ {
+    if (!strcmp(dev->canned->name, "phoenix"))
+       return "AMD Radeon 780M Graphics";
++   if (!strcmp(dev->canned->name, "strix1"))
++      return "AMD Radeon 880M/890M Graphics";
+    return ACD_MARKETING_NAME;
+ }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,38 @@
+From c98b63b17337d51e2ec8bfabaceb6c8e9624590d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 02:11:12 +0300
+Subject: [PATCH] radv/darwin: a freed BO leaves the table before the kext
+ frees its handle
+
+acd_bo_free asked the kext to free the handle and only then took it out of
+the backend's table. Between the two another thread's allocation could get
+the same handle back from the kext, find it still in the table and fail
+("kext returned BO handle N twice"), leaking that kext BO. The Metal
+plugin frees textures on its pump thread while its main thread creates
+them: ffplay's per-frame texture uploads hit it every second or so.
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index d864269..d00a98d 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -950,11 +950,13 @@ acd_bo_free(acd_device_handle dev, amdgpu_bo_handle bo)
+       r = acd_kext_bo_unmap(dev->core->kext, bo->handle, bo->cpu);
+       bo->cpu = NULL;
+    }
+-   int r2 = acd_kext_bo_free(dev->core->kext, bo->handle);
++   /* out of the table before the kext frees the handle: once freed, the kext may give the same handle to another
++    * thread's allocation at once, which found it still here and failed ("returned BO handle twice") */
+    pthread_mutex_lock(&dev->core->bo_lock);
+    if (dev->core->bos[bo->handle] == bo)
+       dev->core->bos[bo->handle] = NULL;
+    pthread_mutex_unlock(&dev->core->bo_lock);
++   int r2 = acd_kext_bo_free(dev->core->kext, bo->handle);
+    free(bo);
+    return r2 ? r2 : r;
+ }
+-- 
+2.56.0
+

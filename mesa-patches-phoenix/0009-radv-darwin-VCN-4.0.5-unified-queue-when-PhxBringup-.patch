@@ -1,0 +1,122 @@
+From e7e31e70fd6c73db25623d6cf31788b7c837b64c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:59:01 +0300
+Subject: [PATCH] radv/darwin: VCN 4.0.5 unified queue when PhxBringup runs it
+
+PhxBringup build 42 runs Strix Point's video engine for clients (N48N_INFO_VCN). The backend now answers what
+amdgpu answers on the 880M - the VCN_ENC (unified) IP, its firmware version and the vcn_4_0_0 codec tables - so RADV
+gets a video decode queue there; nothing changes while the kext does not report VCN. VIDEO_CAPS also stops leaving
+the caller's buffer untouched: ac_fill_video_info ANDed its supported flags with whatever the stack held.
+---
+ include/darwin/navi48_native_abi.h    |  4 ++
+ src/amd/common/darwin/ac_darwin_drm.c | 58 +++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/include/darwin/navi48_native_abi.h b/include/darwin/navi48_native_abi.h
+index 74b4468..f325790 100644
+--- a/include/darwin/navi48_native_abi.h
++++ b/include/darwin/navi48_native_abi.h
+@@ -193,6 +193,10 @@ struct n48n_info {                 /* 192 B */
+ #define N48N_INFO_HUNG          (1u << 0)
+ #define N48N_INFO_S1B_POSITIVE  (1u << 1)
+ #define N48N_INFO_NATIVE_BOOT   (1u << 2)
++/* PhxBringup (StrixArc) build 42+: the kext runs Strix Point's VCN 4.0.5 unified queue (AMDGPU_HW_IP_VCN_ENC submits);
++ * with this flag set, reserved[0] holds the VCN firmware version (amdgpu's AMDGPU_INFO_FW_VCN value) instead of the
++ * diagnostic write counter below. */
++#define N48N_INFO_VCN           (1u << 3)
+ /* ABI 1.10 (kext 0.0.640): n48n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+  *   reserved[3] = N48N_BUDGET_* flags
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 7eefa31..132f68c 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -477,6 +477,48 @@ acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void
+    return 0;
+ }
+ 
++/* VCN 4.0.5 (Strix Point) through the kext (N48N_INFO_VCN): the unified queue as amdgpu reports it on the 880M -
++ * amdgpu_kms.c AMDGPU_INFO_HW_IP_INFO for AMDGPU_HW_IP_VCN_ENC (VCN 4.0, ip_discovery 4.0.5, one ring, IB alignment
++ * 256/4) and soc21.c's vcn_4_0_0 codec tables for AMDGPU_INFO_VIDEO_CAPS. Only on the canned strix1 device, and only
++ * while the kext says the ring is up; *fw_out gets the firmware version. */
++static bool
++acd_vcn(struct acd_device *dev, uint32_t *fw_out)
++{
++   struct n48n_info k;
++   if (!dev->core->kext || strcmp(dev->canned->name, "strix1") || acd_kext_query_info(dev->core->kext, &k) ||
++       !(k.flags & N48N_INFO_VCN))
++      return false;
++   if (fw_out)
++      *fw_out = k.reserved[0];
++   return true;
++}
++
++static void
++acd_vcn_caps(struct drm_amdgpu_info_video_caps *caps, bool encode)
++{
++   static const struct { uint32_t idx, w, h, level; } dec[] = {
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC, 4096, 4096, 52},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC, 8192, 4352, 186},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_JPEG, 16384, 16384, 0},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9, 8192, 4352, 0},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1, 8192, 4352, 0},
++   }, enc[] = {
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC, 4096, 4096, 0},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC, 8192, 4352, 0},
++      {AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1, 8192, 4352, 0},
++   };
++   const unsigned n = encode ? ARRAY_SIZE(enc) : ARRAY_SIZE(dec);
++   for (unsigned i = 0; i < n; i++) {
++      const uint32_t idx = encode ? enc[i].idx : dec[i].idx;
++      struct drm_amdgpu_info_video_codec_info *c = &caps->codec_info[idx];
++      c->valid = 1;
++      c->max_width = encode ? enc[i].w : dec[i].w;
++      c->max_height = encode ? enc[i].h : dec[i].h;
++      c->max_pixels_per_frame = c->max_width * c->max_height;
++      c->max_level = encode ? enc[i].level : dec[i].level;
++   }
++}
++
+ static int
+ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+ {
+@@ -492,6 +534,10 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+          *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_gfx;
+       else if (info->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE)
+          *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_compute;
++      else if (info->query_hw_ip.type == AMDGPU_HW_IP_VCN_ENC && acd_vcn(dev, NULL))
++         *(struct drm_amdgpu_info_hw_ip *)out = (struct drm_amdgpu_info_hw_ip){
++            .hw_ip_version_major = 4, .hw_ip_version_minor = 0, .ib_start_alignment = 256, .ib_size_alignment = 4,
++            .available_rings = 0x1, .ip_discovery_version = 0x040005};
+       return 0;
+    case AMDGPU_INFO_HW_IP_COUNT:
+       *(uint32_t *)out = 1;
+@@ -503,6 +549,12 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+          *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_pfp;
+       else if (info->query_fw.fw_type == AMDGPU_INFO_FW_GFX_MEC)
+          *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_mec;
++      else if (info->query_fw.fw_type == AMDGPU_INFO_FW_VCN) {
++         uint32_t fw = 0;
++         if (!acd_vcn(dev, &fw))
++            return -EINVAL;
++         *(struct drm_amdgpu_info_firmware *)out = (struct drm_amdgpu_info_firmware){.ver = fw, .feature = 0};
++      }
+       return 0;
+    case AMDGPU_INFO_READ_MMR_REG:
+       info_read_mmr_reg(d, info->read_mmr_reg.dword_offset, info->read_mmr_reg.count,
+@@ -540,6 +592,12 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+          return acd_info_memory(dev, info, out);
+       return -EINVAL;
+    case AMDGPU_INFO_VIDEO_CAPS:
++      /* the caller reads every codec slot: never leave them as it found them (ac_fill_video_info used to AND its
++       * "supported" flags with stack garbage here) */
++      memset(out, 0, info->return_size < sizeof(struct drm_amdgpu_info_video_caps) ? info->return_size
++                                                                                     : sizeof(struct drm_amdgpu_info_video_caps));
++      if (info->return_size >= sizeof(struct drm_amdgpu_info_video_caps) && acd_vcn(dev, NULL))
++         acd_vcn_caps(out, info->video_cap.type == AMDGPU_INFO_VIDEO_CAPS_ENCODE);
+       return 0;
+    case AMDGPU_INFO_TIMESTAMP: {
+       /* the GPU clock VK_EXT_calibrated_timestamps pairs with the host clock: upper, lower, upper again (the lower
+-- 
+2.56.0
+
