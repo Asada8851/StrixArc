@@ -1,0 +1,32 @@
+#!/bin/bash
+# vplay <file> [ffplay options]: plays a video with StrixArc's ffplay, decoding on the 880M's VCN when it is up (VCN at
+# boot, phxboot with /Users/Shared/gpu/phxboot-vcn), else on the CPU. "VCN Player.app" (install_player.sh) calls it for
+# files opened from Finder. Keys in the window: q quit, f full screen, space pause, arrows seek, m mute.
+# Each file gets a line in ~/Library/Logs/vplay.log: what decoded it (VCN, and how many VCN jobs the kext counted while
+# it played - debug.phxvcn_jobs, PhxBringup 44 - or CPU) and the texture SDL drew from.
+G=/Users/Shared/gpu
+FF=$G/ffmpeg
+LOG=~/Library/Logs/vplay.log
+[ $# -ge 1 ] || { echo "usage: vplay <file> [ffplay options]"; exit 2; }
+[ -x "$FF/bin/ffplay" ] || { echo "vplay: no $FF/bin/ffplay (install_player.sh)"; exit 1; }
+name=$(basename "$1")
+mkdir -p "$(dirname "$LOG")"
+jobs() { sysctl -n debug.phxvcn_jobs 2>/dev/null || echo -1; }
+j0=$(jobs); t0=$(date +%s)
+vcn=0; ioreg -rc PhxBringup -d1 2>/dev/null | grep -q '"phx-vcn" = 1' && vcn=1
+# VCN: frames copied through FFmpeg's staging buffers (cheaper than importing each frame's memory, round 57); without
+# VCN, RADV offers no decode queue and FFmpeg decodes on the CPU by itself
+HW=(); [ $vcn = 1 ] && HW=(-hwaccel vulkan -hwaccel_opts avoid_host_import=1)
+TMP=$(mktemp /tmp/vplay.XXXXXX)
+DYLD_LIBRARY_PATH=$FF/lib "$FF/bin/ffplay" -hide_banner -nostats -loglevel verbose "${HW[@]}" "${@:2}" "$1" 2> "$TMP"
+rc=$?
+j1=$(jobs); secs=$(( $(date +%s) - t0 ))
+tex=$(grep -o 'texture with SDL_PIXELFORMAT_[A-Z0-9]*' "$TMP" | head -1 | sed 's/.*PIXELFORMAT_//')
+if [ $vcn = 1 ] && [ "$j0" -ge 0 ] && [ $((j1 - j0)) -gt 0 ]; then dec="VCN ($((j1 - j0)) VCN jobs)"
+elif [ $vcn = 1 ] && [ "$j0" -lt 0 ] && [ "$tex" = NV12 ]; then dec="VCN (NV12 frames)"
+elif [ $vcn = 1 ]; then dec="CPU (VCN up, but FFmpeg did not use it: $(grep -m1 -iE 'hwaccel|vulkan.*(fail|error)' "$TMP" | cut -c1-120))"
+else dec="CPU (VCN not up this boot)"; fi
+echo "$(date '+%F %T') $name: $dec, texture ${tex:-?}, ${secs}s, exit $rc" >> "$LOG"
+grep -iE 'error|failed' "$TMP" | grep -v 'Error constructing the frame RPS' | head -3 | sed "s|^|$(date '+%F %T')   |" >> "$LOG"
+rm -f "$TMP"
+exit $rc
