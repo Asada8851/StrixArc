@@ -28,7 +28,8 @@ macOS 15.8.1) in October 2026:
 | **GPU bring-up** | PSP (with a driver-owned TMR), SMU, RLC autoload, MES scheduler + KIQ, compute and gfx queues, at every boot (`phxboot` LaunchDaemon, with fail-safes). |
 | **Metal** | Metal on Vulkan works for apps; WindowServer composites on the GPU. |
 | **Display** | Native 3072x1920 at **120 Hz** (v0.2.0): at boot the eDP link is retrained from the firmware's 4.32 Gb/s to 8.1 Gb/s through DMCUB, before WindowServer opens the panel. Each composited frame is copied by **SDMA** into one of two buffers in the carve-out (0.84 ms for a 3K frame, 28 GB/s) and the display flips to it at vblank: ~120 fps at 3K, no tearing, no CPU in the copy. The display engine (DCN 3.5) cannot read system RAM under macOS (its rIOMMU is never enabled). |
-| **Not yet** | video decode/encode, external displays, backlight control, variable refresh. Some heavy animations (Launchpad folders opening) still drop well below 120 fps. |
+| **Video** | H.264 and HEVC (8/10-bit, up to 4K tested) decoded on VCN 4.0.5 through RADV's Vulkan Video, bit-identical to the CPU decoder, in FFmpeg 8.1 and its player ffplay built for it (4K playback: 3.4 s of CPU per 10 s clip instead of 12.2 s, no dropped frames). VCN is brought up by `vcn_decode.sh`; see [docs/strix-point.md](docs/strix-point.md). |
+| **Not yet** | VCN decode for VideoToolbox (Safari, QuickTime), video encode, VCN at boot, external displays, backlight control, variable refresh. Some heavy animations (Launchpad folders opening) still drop well below 120 fps. |
 
 ## Performance
 
