@@ -303,3 +303,58 @@ Still slow: some heavy animations (Launchpad folders opening) drop to 25-60 fps 
 part of it: the display transaction waits synchronously for the frame's GPU work, the previous flip and the copy
 (2-2.5 ms of the 8.3 ms budget); the next step is to queue the copy behind a fence (SDMA polling the composite's
 completion) instead of waiting in WindowServer's present.
+
+## Video: playback, then H.264/HEVC decoded on VCN 4.0.5 (2026-10-27 .. 11-01)
+
+**Playback (phase 1).** User videos stayed black in every player while Metal and YUV surfaces worked: AVPlayer waits on
+the audio clock, and the audio device never started (AppleHDA had no codec layout; the USB interface failed its IO).
+With a working audio kext every player plays; Safari 1080p drops 291 of 3000 frames on the CPU decoder. Found on the
+way: the Metal plugin copied every plane of a multi-plane IOSurface (video frames) into a private image and back at
+each frame, and WindowServer held them until GPU memory ran out; planes are now host imports like single-plane
+surfaces (`NVMTL_NO_PLANE_HOST=1` restores the copies).
+
+**VCN bring-up.** Strix Point has one VCN 4.0.5 (bases 0x7800, 0x7e00, 0x3c030000). It is brought up the way Linux
+does in DPG mode, from the register trace of Linux on this machine (`tools/linux-trace/trace_vcn.sh`): MMHUB 3.3,
+which macOS leaves off, set up like `mmhub_v3_3_gart_enable` with context 0 on the GC hub's GART table; the VCN
+firmware through the PSP (GFX_FW_TYPE_VCN = 13), SMU PowerUpVcn0 (0x07), the DPG SRAM image through the PSP
+(GFX_FW_TYPE_VCN0_RAM = 49, 27 register pairs), then the unified ring (`mesboot vcn up`, POWER_STATUS 1 -> 0x105).
+Under DPG the VCN's own registers read 0xdeadbeef; only the always-on ones (ring pointers, POWER_STATUS) are readable,
+and the write pointer register alone starts the ring. Reading an MMHUB invalidation engine's semaphore register takes
+the semaphore: a register snapshot that read ENG0_SEM froze Linux's VCN ring once.
+
+**Jobs.** `mesboot vcn adopt` hands the ring to PhxBringup (build 43): clients submit AMDGPU_HW_IP_VCN_ENC (7, the
+unified queue; 4 is VCE) IBs, which run in the client's VMID through MMHUB (every bind and TLB flush is mirrored
+there while VCN is adopted). Each job is IB packets, a fence write and a pad to 64 dwords. The kext never gets the
+MMHUB semaphore (its read returns 0 where mesboot's returns 1, cause unknown): flushes go ahead after 20 us, always
+acked (`debug.phxvcn_sem_miss` / `phxvcn_ack_miss`).
+
+**RADV.** Mesa patch 0009 gives the Darwin backend the unified VCN queue (HW_IP_INFO, firmware version, the video
+capability tables of VCN 4.0); built with `MESA_VIDEO_CODECS=h264dec,h265dec`. RADV then offers a decode queue with
+H.264 up to 4096x4096 and HEVC up to 8192x4352, as Linux's RADV does on this 880M. Two backend bugs showed up on the
+way: compute advertised four rings while the kext runs one, so FFmpeg's copies on queues 1-3 were rejected and the
+device lost (0010: one GFX and one compute ring); and a freed BO left the backend's table only after the kext had
+freed its handle, so another thread could get the handle back first and fail ("returned BO handle twice", 0011).
+
+**FFmpeg and ffplay.** FFmpeg 8.1.2 cross-built with Vulkan (`tools/cross/build-ffmpeg.sh`); it dlopens the Vulkan
+loader, and `tools/vkshim` stands in for one: a `libvulkan.dylib` that answers from RADV's ICD entry point. ffplay
+(SDL2 2.32, static, `tools/cross/build-sdl2.sh`) decodes on VCN without its Vulkan renderer (RADV cannot present to a
+Cocoa window): `ffmpeg-patches/0001` copies each frame to memory and puts NV12 straight into an SDL texture.
+`sdl-patches/0001` uploads through reused buffers instead of a new staging texture per update, which in the Metal
+plugin had meant GPU memory allocated, mapped and freed through the kext two or three times a frame.
+
+Results (`tools/phxctl/vcn_decode.sh`, rounds 54-58): every frame decoded on VCN is bit-identical to FFmpeg's CPU
+decoder and to Linux's (H.264 1080p/4K, HEVC 4K 8- and 10-bit, a user clip). The decode alone of 300 frames of 4K
+takes 0.9-1.4 s of CPU on VCN against 11-17 s on the CPU decoder (153-235 fps). Playing a 10 s 4K HEVC clip in ffplay:
+
+| | ffplay CPU | dropped frames |
+|---|---|---|
+| CPU decoder | 12.2 s | 0 |
+| VCN, round 55 (staging texture per update, the BO race) | 7.8 s | 23 |
+| **VCN, round 58** | **3.4 s** | **0** |
+
+10-bit HEVC costs more (9-10 s): SDL2 has no P010 texture, so the frame is converted to 8 bits by swscale.
+WindowServer composites the window for another 2-3.5 s of CPU per clip.
+
+Limits: only programs on this FFmpeg use VCN (`ffmpeg`, `ffplay`, `vcn_decode.sh play <file>`); VideoToolbox, and so
+Safari, QuickTime and AVFoundation players, still decode on the CPU. VCN is brought up by the test script, not at
+boot, and the RADV with 0009-0011 runs from the round folder; the installed one (WindowServer's) still has the BO race.

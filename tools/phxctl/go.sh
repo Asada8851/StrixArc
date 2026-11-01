@@ -35,6 +35,16 @@ if [ "$(cat $G/.accel-installed 2>/dev/null)" != "$NEWSUM" ]; then
     if [ "${PIPESTATUS[0]}" = 0 ] && echo "$NEWSUM" | sudo tee $G/.accel-installed >/dev/null; then need_reboot "PhxAccel updated (Aux KC)"
     else say "STOP: update_accel.sh failed (above)"; exit 1; fi
 else say "PhxAccel is this folder's build"; fi
+# 3b. the Metal plugin's binary: the installed copy is re-signed too, so its package checksum is kept in $G/.plugin-installed
+if [ -f "$HERE/metal/NVMTLDriver" ] && [ -f "$HERE/update_plugin.sh" ]; then
+    PSUM=$(shasum "$HERE/metal/NVMTLDriver" | cut -d' ' -f1)
+    if [ "$(cat $G/.plugin-installed 2>/dev/null)" != "$PSUM" ]; then
+        say "Metal plugin: installing this folder's build"
+        sudo bash "$HERE/update_plugin.sh" | tail -2
+        if [ "${PIPESTATUS[0]}" = 0 ] && echo "$PSUM" | sudo tee $G/.plugin-installed >/dev/null; then need_reboot "Metal plugin updated (WindowServer loads it at boot)"
+        else say "STOP: update_plugin.sh failed (above)"; exit 1; fi
+    else say "Metal plugin is this folder's build"; fi
+fi
 # 4. the boot daemon and the scripts it runs; also the way back from phxboot's kill switch
 changed=""
 for f in phxboot.sh full.sh bringup5.sh nullarc_logs.sh; do cmp -s "$HERE/gpu/$f" "$G/$f" || changed="$changed $f"; done

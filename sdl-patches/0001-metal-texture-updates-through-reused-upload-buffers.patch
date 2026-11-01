@@ -1,0 +1,131 @@
+SDL2 Metal renderer: texture updates through a pool of upload buffers instead of a staging texture each
+
+After a texture's first upload, SDL 2.32's Metal renderer copies every update into a new staging texture and blits
+that over (its own TODO asks for a pool). A video player updates two or three planes per frame; with StrixArc's
+Metal plugin each new texture is a Vulkan image with GPU memory allocated, mapped and freed through the kext, and the
+upload into it a GPU copy waited on - about a fifth of a core at 4K 30 fps (round 56's profile). Updates now memcpy
+into a shared MTLBuffer and blit buffer -> texture in the same command buffer; the buffer goes back to the pool when
+that command buffer completes (best fit, at most 8 kept). Formats other than 8/16-bit R/RG/RGBA keep the old path.
+
+--- a/src/render/metal/SDL_render_metal.m
++++ b/src/render/metal/SDL_render_metal.m
+@@ -136,6 +136,7 @@
+     @property (nonatomic, assign) METAL_ShaderPipelines *activepipelines;
+     @property (nonatomic, assign) METAL_ShaderPipelines *allpipelines;
+     @property (nonatomic, assign) int pipelinescount;
++    @property (nonatomic, retain) NSMutableArray<id<MTLBuffer>> *uploadpool;
+ @end
+ 
+ @implementation METAL_RenderData
+@@ -647,6 +648,40 @@
+     return MTLStorageModeShared;
+ }
+ 
++/* Bytes per pixel of the formats texture updates go to; 0: not handled by the upload buffers (staging texture). */
++static NSUInteger METAL_UploadBytesPerPixel(MTLPixelFormat format)
++{
++    switch (format) {
++    case MTLPixelFormatR8Unorm: return 1;
++    case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Unorm: return 2;
++    case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRG16Unorm: return 4;
++    default: return 0;
++    }
++}
++
++/* A shared buffer of at least len bytes: the smallest one the GPU is done with (a Y plane's buffer is not spent on
++ * a chroma plane), else a new one. */
++static id<MTLBuffer> METAL_TakeUploadBuffer(METAL_RenderData *data, NSUInteger len)
++{
++    NSMutableArray<id<MTLBuffer>> *pool = data.uploadpool;
++    if (pool != nil) {
++        @synchronized(pool) {
++            NSUInteger best = NSNotFound;
++            for (NSUInteger i = 0; i < pool.count; i++) {
++                if (pool[i].length >= len && (best == NSNotFound || pool[i].length < pool[best].length)) {
++                    best = i;
++                }
++            }
++            if (best != NSNotFound) {
++                id<MTLBuffer> buf = pool[best];
++                [pool removeObjectAtIndex:best];
++                return buf;
++            }
++        }
++    }
++    return [data.mtldevice newBufferWithLength:len options:MTLResourceStorageModeShared];
++}
++
+ static int METAL_UpdateTextureInternal(SDL_Renderer * renderer, METAL_TextureData *texturedata,
+                             id<MTLTexture> texture, SDL_Rect rect, int slice,
+                             const void * pixels, int pitch)
+@@ -665,6 +700,62 @@
+         return 0;
+     }
+ 
++    /* Later uploads go through a pool of shared buffers, reused once the GPU has copied them, instead of a new
++     * staging texture per update: a video player updates every frame, and on drivers where creating a texture
++     * means allocating and mapping GPU memory, that creation cost more than the copy. */
++    {
++        const NSUInteger bpp = METAL_UploadBytesPerPixel(texture.pixelFormat);
++        const NSUInteger row = ((NSUInteger)rect.w * bpp + 255) & ~(NSUInteger)255;
++        const NSUInteger len = row * (NSUInteger)rect.h;
++        id<MTLBuffer> buf = bpp ? METAL_TakeUploadBuffer(data, len) : nil;
++        if (buf != nil) {
++            NSMutableArray<id<MTLBuffer>> *pool = data.uploadpool;
++            Uint8 *dst = (Uint8 *)buf.contents;
++            const Uint8 *src = (const Uint8 *)pixels;
++            int y;
++
++            if ((NSUInteger)pitch == row) {
++                SDL_memcpy(dst, src, len);
++            } else {
++                for (y = 0; y < rect.h; y++) {
++                    SDL_memcpy(dst + y * row, src + y * pitch, rect.w * bpp);
++                }
++            }
++
++            if (data.mtlcmdencoder != nil) {
++                [data.mtlcmdencoder endEncoding];
++                data.mtlcmdencoder = nil;
++            }
++            if (data.mtlcmdbuffer == nil) {
++                data.mtlcmdbuffer = [data.mtlcmdqueue commandBuffer];
++            }
++            blitcmd = [data.mtlcmdbuffer blitCommandEncoder];
++            [blitcmd copyFromBuffer:buf
++                       sourceOffset:0
++                  sourceBytesPerRow:row
++                sourceBytesPerImage:len
++                         sourceSize:MTLSizeMake(rect.w, rect.h, 1)
++                          toTexture:texture
++                   destinationSlice:slice
++                   destinationLevel:0
++                  destinationOrigin:MTLOriginMake(rect.x, rect.y, 0)];
++            [blitcmd endEncoding];
++            [data.mtlcmdbuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++                if (pool != nil) {
++                    @synchronized(pool) {
++                        if (pool.count < 8) {
++                            [pool addObject:buf];
++                        }
++                    }
++                }
++            }];
++            /* committed now, as below: the next draw starts a command buffer of its own */
++            [data.mtlcmdbuffer commit];
++            data.mtlcmdbuffer = nil;
++            return 0;
++        }
++    }
++
+     desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat
+                                                               width:rect.w
+                                                              height:rect.h
+@@ -1677,6 +1768,7 @@
+ 
+     // !!! FIXME: error checking on all of this.
+     data = [[METAL_RenderData alloc] init];
++    data.uploadpool = [NSMutableArray array];
+ 
+     if (data == nil) {
+         /* Release the metal view instead of destroying it,

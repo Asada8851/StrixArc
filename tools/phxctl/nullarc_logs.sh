@@ -17,6 +17,9 @@ DEST=${NULLARC_LOGS_DEST:-}
 [ -n "$DEST" ] || DEST=~/nullarc_logs
 D="$DEST/$(date '+%Y%m%d-%H%M%S')-$TAG"
 mkdir -p "$D" 2>/dev/null || { D=~/nullarc_logs/$(date '+%Y%m%d-%H%M%S')-$TAG; mkdir -p "$D"; }
+# the test's own files first: the unified-log queries below take up to a minute, and a Ctrl-C or a reboot in that minute
+# lost them (round 53, 2026-10-28: the stick got everything but the test's log)
+for f in "$@"; do [ -f "$f" ] && cp "$f" "$D/"; done; sync
 S=""; [ "$(id -u)" = 0 ] || { sudo -n true 2>/dev/null && S="sudo -n"; }
 # "{ sec = 1761501234, usec = 0 } ...": the first number (a greedy .*sec matched usec: boot read as 1970, 2026-10-26)
 BOOT=$(sysctl -n kern.boottime | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
@@ -76,7 +79,6 @@ for dir in /Library/Logs/DiagnosticReports ~/Library/Logs/DiagnosticReports; do
         while IFS= read -r f; do $S cp "$f" "$D/reports/" 2>/dev/null; done
 done
 ls -la /Library/Logs/DiagnosticReports 2>/dev/null | tail -30 > "$D/reports/list.txt"
-for f in "$@"; do [ -f "$f" ] && cp "$f" "$D/"; done
 wait $P1 ${P2:-} ${P3:-} 2>/dev/null
 $S chown -R "$(id -u)" "$D" 2>/dev/null
 sync

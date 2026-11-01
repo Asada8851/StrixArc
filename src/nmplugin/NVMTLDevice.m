@@ -910,27 +910,40 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     // allocation imported as host memory (VK_EXT_external_memory_host), so nothing is copied in or out. Without it
     // WindowServer read each composited 2560x1600 frame back with memmove: ~12 ms and ~1.3 GB/s of its CPU, and the
     // panel then copied the write-combined result again (2026-10-20). NVMTL_NO_SURFACE_HOST=1 keeps the copies.
-    static int hostOn = -1;
+    static int hostOn = -1, planesOn = -1;
     if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
-    if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
-        void *base = IOSurfaceGetBaseAddress(surf);
-        const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
+    // The planes of a multi-plane surface (video: 420v/420f/x420 luma + chroma) the same way, each plane an image over the
+    // whole allocation at the plane's offset. Before, every plane became a private image copied in and out at each frame
+    // (a 4K 10-bit frame: 25 MB each way), and WindowServer held them until it ran out of GPU memory (2026-10-27).
+    // NVMTL_NO_PLANE_HOST=1 keeps the private copies for multi-plane surfaces.
+    if (planesOn < 0) planesOn = !getenv("NVMTL_NO_PLANE_HOST");
+    const size_t np = surf ? IOSurfaceGetPlaneCount(surf) : 0;
+    if (hostOn && surf && ((plane == 0 && np <= 1) || (planesOn && np > 1 && plane < np))) {
+        uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+        uint8_t *pbase = np > 1 ? (uint8_t *)IOSurfaceGetBaseAddressOfPlane(surf, plane) : base;
+        const size_t row = np > 1 ? IOSurfaceGetBytesPerRowOfPlane(surf, plane) : IOSurfaceGetBytesPerRow(surf);
+        const size_t sh = np > 1 ? IOSurfaceGetHeightOfPlane(surf, plane) : IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
         // the surface is mapped in whole pages: its allocation rounded up to the import alignment is still its own
         const size_t alloc = IOSurfaceGetAllocSize(surf), span = al ? (alloc + al - 1) & ~(al - 1) : 0;
-        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && (size_t)w * (bpp ? bpp : 4) <= row
-            && h <= sh && row % 32 == 0 && row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+        const size_t off = (base && pbase >= base) ? (size_t)(pbase - base) : (size_t)-1;
+        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && off < alloc && (size_t)w * (bpp ? bpp : 4) <= row
+            && h <= sh && row % 32 == 0 && off + row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
             nvk_buffer hb;
             if (!nvmtl_vk_buffer_import_host(base, span, &hb)) {
-                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, off, row, &t->_i)) {
                     t->_hostBuf = hb; t->_hostOn = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
                     static unsigned long long nh; static unsigned said;
                     if (said++ < 8 || ++nh % 2000 == 0)
-                        nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                        nvlog("surface %u %ux%u plane %lu of %zu at +%zu pitch %zu -> its own pages (host import, no copies)",
+                              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane, np ? np : 1, off, row);
                     return 0;
                 }
                 nvmtl_vk_buffer_destroy(&hb);
             }
         }
+        if (np > 1) { static unsigned said; if (said++ < 8)
+            nvlog("surface %u plane %lu of %zu (%ux%u, at +%zu pitch %zu of %zu bytes, base %p): not importable - a private copy",
+                  (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, np, w, h, off, row, alloc, (void *)base); }
     }
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
@@ -975,14 +988,38 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
 // while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
 // Called under @synchronized(device).
+// "Only the backing holds it" counts the backings: a multi-plane surface has one entry per plane, each retaining the
+// surface, so with `<= 1` a video frame's surface (2 planes) was never dropped - every decoder pool's surfaces and their
+// private images stayed in WindowServer for good (1.1 GB after six clips, then no GPU memory left: 2026-10-27).
 static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    CFMutableDictionaryRef held = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);   // surface -> entries retaining it
+    for (NSArray *k in keep) {
+        NVMTLTexture *b = keep[k];
+        if (b->_surf && b->_surfOwned) CFDictionarySetValue(held, b->_surf, (const void *)((uintptr_t)CFDictionaryGetValue(held, b->_surf) + 1));
+    }
+    unsigned dropped = 0;
     for (NSArray *k in keep.allKeys) {
         NVMTLTexture *b = keep[k];
-        if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [keep removeObjectForKey:k];
+        const CFIndex mine = b->_surf ? (CFIndex)(uintptr_t)CFDictionaryGetValue(held, b->_surf) : 0;
+        if (!b->_surf || CFGetRetainCount(b->_surf) <= (mine > 1 ? mine : 1)) { [keep removeObjectForKey:k]; dropped++; }
     }
+    CFRelease(held);
     keep[key] = t;
+    // logged when it moved: 32 entries or 64 MB of private images since the last line (and the first 16, every 1000th)
+    static unsigned long long inserts, droppedAll, lastPriv; static unsigned said; static unsigned long lastN;
+    droppedAll += dropped; inserts++;
+    unsigned long long priv = 0; unsigned host = 0;
+    for (NSArray *k in keep) { NVMTLTexture *b = keep[k];
+        if (b->_hostOn) host++; else priv += (unsigned long long)b->_i.w * b->_i.h * (b->_i.bpp ? b->_i.bpp : 4); }
+    const unsigned long n = (unsigned long)keep.count;
+    if (said < 16 || inserts % 1000 == 0 || (n > lastN ? n - lastN : lastN - n) >= 32
+        || (priv > lastPriv ? priv - lastPriv : lastPriv - priv) >= (64ull << 20)) {
+        said++; lastN = n; lastPriv = priv;
+        nvlog("surface keep: %lu entries (%u on their surface's pages, private images %llu MB), %u dropped now, %llu inserts, %llu dropped in all",
+              n, host, priv >> 20, dropped, inserts, droppedAll);
+    }
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {

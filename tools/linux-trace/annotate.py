@@ -20,6 +20,7 @@ IPS = {
     "SMUIO":  ("smuio_14_0_2_offset.h",  [0x16800, 0x16A00, 0x440000, 0x2401000, 0x3C010000]),
     "ATHUB":  ("athub_3_0_0_offset.h",   [0xC00, 0x13300, 0x2408C00, 0x3C08C000]),
     "DCN":    ("dcn_3_5_0_offset.h",     [0x12, 0xC0, 0x34C0, 0x9000, 0x2403C00, 0x3C03C000]),
+    "VCN":    ("vcn_4_0_5_offset.h",     [0x7800, 0x7E00, 0x3C030000]),
 }
 
 

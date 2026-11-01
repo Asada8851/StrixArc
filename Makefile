@@ -10,9 +10,10 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_rdna3_ucode \
         $(TEST_BIN_DIR)/test_r3n_abi \
         $(TEST_BIN_DIR)/test_rdna3_chip \
+        $(TEST_BIN_DIR)/test_vcn \
         $(TEST_BIN_DIR)/fwplan
 
-.PHONY: all test clean kext fixtures
+.PHONY: all test clean kext fixtures bench
 
 all: test
 
@@ -35,6 +36,9 @@ $(TEST_BIN_DIR)/test_rdna3_chip: tests/test_rdna3_chip.cpp src/amd/rdna3_chip.h 
 	$(CC) -std=c99 -Wall -Wextra -Werror -Isrc/amd -c tests/test_rdna3_chip_c.c -o $(TEST_BIN_DIR)/test_rdna3_chip_c.o
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_rdna3_chip.cpp $(TEST_BIN_DIR)/test_rdna3_chip_c.o -o $@
 
+$(TEST_BIN_DIR)/test_vcn: tests/test_vcn.c src/amd/vcn_v4_0_5.h src/amd/vcn_regs_strix.h src/phxbringup/PhxNativeABI.h | $(TEST_BIN_DIR)
+	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc/amd -Isrc/phxbringup tests/test_vcn.c -o $@
+
 # fwplan is a tool, not a test: built here so CI compiles it; `test` runs it on the Strix Point fixtures
 $(TEST_BIN_DIR)/fwplan: tools/fwplan/fwplan.cpp src/amd/rdna3_ucode_extract.cpp | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
@@ -51,6 +55,20 @@ test: $(TESTS)
 		test $$(grep -vc '^#' $(TEST_BIN_DIR)/fwplan_strix.txt) -eq 17 || { echo "fwplan: expected 17 payloads"; exit 1; }; \
 	fi
 	@echo "All unit tests passed successfully!"
+
+# the client bench: macOS tools that talk to PhxBringup, built for Linux against tools/bench (an IOKit shim and phxmock,
+# a model of PhxBringup's user client) and run end to end before a hardware round
+MESA ?= $(HOME)/opt/nullarc-cross/mesa
+BENCH_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter -Itools/bench/include -Isrc/phxbringup -Isrc/amd
+$(TEST_BIN_DIR)/vcnjob_bench: tools/vcnjob/vcnjob.c tools/bench/phxmock.c src/amd/vcn_v4_0_5.h src/phxbringup/PhxNativeABI.h | $(TEST_BIN_DIR)
+	$(CC) $(BENCH_CFLAGS) tools/vcnjob/vcnjob.c tools/bench/phxmock.c -o $@
+
+bench: $(TEST_BIN_DIR)/vcnjob_bench
+	@echo "=== client bench (phxmock) ==="
+	$(TEST_BIN_DIR)/vcnjob_bench 16
+	@! PHXMOCK_NOVCN=1 $(TEST_BIN_DIR)/vcnjob_bench 1 > /dev/null || { echo "vcnjob ran without VCN"; exit 1; }
+	@if [ -d "$(MESA)/build-darwin" ]; then bash tools/bench/acd_bench.sh $(MESA); else echo "(no Mesa tree at MESA=$(MESA): acd_bench skipped)"; fi
+	@echo "bench passed"
 
 fixtures:
 	bash tools/fetch_test_firmware.sh tests/fixtures/phoenix phoenix
