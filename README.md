@@ -1,7 +1,8 @@
 # StrixArc
 
 **Metal on the AMD Radeon 880M / 890M (Strix Point, RDNA 3.5, GC 11.5.0) for macOS Sequoia 15.**
-GPU bring-up, a display path WindowServer composites on, and Metal over Vulkan (Mesa RADV).
+GPU bring-up, a display path WindowServer composites on, Metal over Vulkan (Mesa RADV), and H.264/HEVC decoded on
+the GPU's video engine (VCN) in FFmpeg and its player.
 
 StrixArc is a port of [nullarc](https://github.com/luuumi-dev/nullarc) (Radeon 780M, Phoenix) to Strix Point. The
 code keeps nullarc's component names (PhxBringup, PhxAccel, NVMTLDriver) and its licenses; see [LICENSE](LICENSE).
@@ -28,8 +29,8 @@ macOS 15.8.1) in October 2026:
 | **GPU bring-up** | PSP (with a driver-owned TMR), SMU, RLC autoload, MES scheduler + KIQ, compute and gfx queues, at every boot (`phxboot` LaunchDaemon, with fail-safes). |
 | **Metal** | Metal on Vulkan works for apps; WindowServer composites on the GPU. |
 | **Display** | Native 3072x1920 at **120 Hz** (v0.2.0): at boot the eDP link is retrained from the firmware's 4.32 Gb/s to 8.1 Gb/s through DMCUB, before WindowServer opens the panel. Each composited frame is copied by **SDMA** into one of two buffers in the carve-out (0.84 ms for a 3K frame, 28 GB/s) and the display flips to it at vblank: ~120 fps at 3K, no tearing, no CPU in the copy. The display engine (DCN 3.5) cannot read system RAM under macOS (its rIOMMU is never enabled). |
-| **Video** | H.264 and HEVC (8/10-bit, up to 4K tested) decoded on VCN 4.0.5 through RADV's Vulkan Video, bit-identical to the CPU decoder, in FFmpeg 8.1 and its player ffplay built for it (4K playback: 3.4 s of CPU per 10 s clip instead of 12.2 s, no dropped frames). VCN is brought up by `vcn_decode.sh`; see [docs/strix-point.md](docs/strix-point.md). |
-| **Not yet** | VCN decode for VideoToolbox (Safari, QuickTime), video encode, VCN at boot, external displays, backlight control, variable refresh. Some heavy animations (Launchpad folders opening) still drop well below 120 fps. |
+| **Video** (v0.2.5) | H.264 and HEVC (8/10-bit, up to 4K tested) decoded on VCN 4.0.5 through RADV's Vulkan Video, bit-identical to the CPU decoder, in FFmpeg 8.1 and its player: `vplay <file>` or **VCN Player.app** from Finder (4K playback: ~3.5 s of CPU per 10 s clip instead of 12.2 s, no dropped frames). VCN comes up at boot; `sysctl debug.phxvcn_jobs` and `~/Library/Logs/vplay.log` show it decoding. Safari, QuickTime and other VideoToolbox players still decode on the CPU. See [docs/strix-point.md](docs/strix-point.md). |
+| **Not yet** | VCN decode for VideoToolbox (Safari, QuickTime), video encode, external displays, backlight control, variable refresh. Some heavy animations (Launchpad folders opening) still drop well below 120 fps. |
 
 ## Performance
 
@@ -137,6 +138,9 @@ names are those of a test round folder; in the repository the Strix versions are
 | `hz120.pending` | the 120 Hz switch of this boot is not through yet (until WindowServer's 90 s watch) | automatic; found at the next boot it means a hang: `phxboot-120` is removed |
 | `hz60.base` | the firmware's 60 Hz display values, saved by the first `mesboot hz` | automatic; what `hz 60` puts back |
 | `phxboot-apps` | Metal for every app when WindowServer is not on the GPU | `sudo touch` / `sudo rm` |
+| `phxboot-vcn` | VCN at boot: up and handed to PhxBringup after WindowServer's watch, so players decode on it | `go.sh` creates it once for a release or round folder that has the file `VCNBOOT`; phxboot removes it after VCN failed to come up; `sudo rm` it |
+| `vcn.pending` | VCN is coming up this boot (20 s) | automatic; found at the next boot it means a hang: `phxboot-vcn` is removed |
+| `radv.pending` | a new RADV on trial (`update_radv.sh`): `new`, then `tried` once a boot runs WindowServer on it | phxboot removes it once WindowServer got through its 90 s watch; a boot on it that did not puts the previous RADV back |
 | `logs/*-atboot` | each boot's logs, ~100 s after boot (the last 6) | automatic; `nullarc_logs.sh` copies them to the USB stick |
 
 Backups and how to undo each change:
@@ -148,6 +152,9 @@ Backups and how to undo each change:
 | native 3K (OpenCore `Resolution=Max`) | `EFI/OC/config-1920x1200.plist` is the config from before: copy it over `config.plist` |
 | the boot daemon | `sudo bash install_boot.sh --undo` (the GPU is no longer brought up at boot) |
 | HiDPI modes | `sudo bash gpu/hidpi.sh --undo` |
+| the RADV (`/Library/GPUBundles/nvmtl/libvulkan_radeon.dylib`) | automatic if WindowServer fails on a new one; else `sudo bash ~/gpu/update_radv.sh --undo` and reboot (backups in `/Users/Shared/nullarc-backup/radv-update.*`) |
+| VCN at boot | `sudo rm /Users/Shared/gpu/phxboot-vcn` and reboot |
+| the player (`/Users/Shared/gpu/ffmpeg`, `/usr/local/bin/vplay`, `/Applications/VCN Player.app`) | `sudo bash ~/gpu/install_player.sh --undo` |
 | 120 Hz | `sudo rm /Users/Shared/gpu/phxboot-120` and reboot (or, this boot only: `sudo ~/gpu/phxctl/mesboot hz 60`; WindowServer keeps pacing at 120 until the reboot) |
 
 ## How the frame reaches the panel
@@ -181,8 +188,8 @@ The details, with every measurement, are in [docs/strix-point.md](docs/strix-poi
 ## Release package
 
 `StrixArc-<version>.zip` (GitHub releases) is the test-round folder the reference machine ran - the binaries exactly as
-tested (PhxBringup, PhxAccel, the NVMTLDriver binary, RADV, `mesboot`/`phxctl`/`fwplan`) - plus the 9 firmware files
-from linux-firmware (unmodified) and the licenses. NullMoth's bundle and its AIR translator are not in it:
+tested (PhxBringup, PhxAccel, the NVMTLDriver binary, RADV, `mesboot`/`phxctl`/`fwplan`, FFmpeg/ffplay) - plus the 10
+firmware files from linux-firmware (unmodified) and the licenses. NullMoth's bundle and its AIR translator are not in it:
 `setup_metal.sh` takes them from NullMoth 2.4.1's package. Its `README.txt` gives the order: PhxBringup into OpenCore,
 `bash install.sh`, `sudo bash setup_metal.sh <NullMoth pkgroot> .`, `bash go.sh`, reboot, `bash go.sh` again.
 

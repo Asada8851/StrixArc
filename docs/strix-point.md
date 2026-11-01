@@ -358,3 +358,13 @@ WindowServer composites the window for another 2-3.5 s of CPU per clip.
 Limits: only programs on this FFmpeg use VCN (`ffmpeg`, `ffplay`, `vcn_decode.sh play <file>`); VideoToolbox, and so
 Safari, QuickTime and AVFoundation players, still decode on the CPU. VCN is brought up by the test script, not at
 boot, and the RADV with 0009-0011 runs from the round folder; the installed one (WindowServer's) still has the BO race.
+
+**Everyday use (v0.2.5, round 60).** The new RADV (0001-0011) replaced the installed one: `update_radv.sh` keeps the
+previous one and leaves `$G/radv.pending`; phxboot runs WindowServer on it at the next boot and keeps it once the
+90 s watch passes, and puts the previous one back after a boot that did not (round 59 first ran the Metal tests on both
+in their own processes through `NVMTL_ICD_LIB`: same results). With `$G/phxboot-vcn`, phxboot brings VCN up and hands it
+to PhxBringup after the watch, so any client decodes on it without a script; mesboot refuses to touch a ring the kext
+holds. `vplay` / VCN Player.app (an AppleScript droplet, so Finder's "Open with" works) run ffplay on it and log per
+file whether VCN decoded it; PhxBringup 44 counts VCN's jobs (`debug.phxvcn_jobs`: one per frame, plus one per
+session). Round 60: WindowServer on the new RADV at 120 Hz 122.7 fps, 33.6 % CPU (v0.2.0: ~122 fps, 26-47 %); VCN held
+at idle costs ~5 MMHUB flushes a second; 4K HEVC in vplay 301 VCN jobs for 300 frames, 3.8 s of CPU per 12 s.

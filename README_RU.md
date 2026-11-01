@@ -22,7 +22,8 @@ StrixArc — порт [nullarc](https://github.com/luuumi-dev/nullarc) (Radeon 7
 | **Запуск GPU** | PSP (с TMR от драйвера), SMU, RLC, MES + KIQ, очереди compute и gfx — при каждой загрузке (`phxboot`, со страховками). |
 | **Metal** | работает в приложениях; WindowServer композитит на GPU. |
 | **Экран** | родные 3072x1920 при **120 Гц** (v0.2.0): при загрузке линк eDP перетренировывается с 4,32 Гбит/с прошивки на 8,1 Гбит/с через DMCUB, до того как WindowServer откроет экран. Кадр копирует **SDMA** в один из двух буферов видеопамяти (0,84 мс на кадр 3K), экран переключается на него по vsync: ~120 fps, без разрывов, процессор в копировании не участвует. |
-| **Пока нет** | видео, внешние мониторы, подсветка, переменная частота. Некоторые тяжёлые анимации (открытие папок в Launchpad) пока проседают заметно ниже 120 fps. |
+| **Видео** (v0.2.5) | H.264 и HEVC (8/10 бит, проверено до 4K) декодируются на видеоблоке GPU (VCN 4.0.5) через Vulkan Video в RADV — побитово так же, как программный декодер, — в FFmpeg 8.1 и его плеере: `vplay <файл>` или **VCN Player.app** из Finder («Свойства» → «Открыть в программе»). 4K: ~3,5 с процессора на 10-секундный ролик вместо 12,2 с, без пропущенных кадров. VCN поднимается при загрузке; `sysctl debug.phxvcn_jobs` и `~/Library/Logs/vplay.log` показывают, что декодирует VCN. Safari, QuickTime и другие плееры через VideoToolbox пока декодируют на процессоре. |
+| **Пока нет** | аппаратный декод для VideoToolbox (Safari, QuickTime), кодирование видео, внешние мониторы, подсветка, переменная частота. Некоторые тяжёлые анимации (открытие папок в Launchpad) пока проседают заметно ниже 120 fps. |
 
 ## Производительность
 
@@ -134,6 +135,9 @@ WindowServer открывает экран.
 | `hz120.pending` | переключение на 120 Гц в этой загрузке ещё не подтверждено (до конца 90 с наблюдения за WindowServer) | сам; если он остался к следующей загрузке, значит было зависание: `phxboot-120` удаляется |
 | `hz60.base` | значения дисплея прошивки для 60 Гц, сохраняет первый `mesboot hz` | сам; их возвращает `hz 60` |
 | `phxboot-apps` | Metal для всех приложений, когда WindowServer не на GPU | `sudo touch` / `sudo rm` |
+| `phxboot-vcn` | VCN при загрузке: поднимается и передаётся PhxBringup после 90-секундной проверки WindowServer, плееры декодируют на нём | `go.sh` создаёт его один раз для релиза или раунда с файлом `VCNBOOT`; phxboot удаляет его, если VCN не поднялся; `sudo rm` |
+| `vcn.pending` | VCN поднимается в этой загрузке (20 с) | автоматически; найден при следующей загрузке — значит, было зависание: `phxboot-vcn` удаляется |
+| `radv.pending` | новый RADV на испытании (`update_radv.sh`): `new`, затем `tried`, когда загрузка запустила на нём WindowServer | phxboot удаляет его, когда WindowServer прошёл 90-секундную проверку; если загрузка на нём её не прошла — возвращает прежний RADV |
 | `logs/*-atboot` | логи каждой загрузки через ~100 с после старта (последние 6) | сами; `nullarc_logs.sh` копирует их на флешку |
 
 Резервные копии и откат каждого изменения:
@@ -145,13 +149,16 @@ WindowServer открывает экран.
 | родные 3K (OpenCore `Resolution=Max`) | `EFI/OC/config-1920x1200.plist` — прежний конфиг, скопировать поверх `config.plist` |
 | загрузочный демон | `sudo bash install_boot.sh --undo` (GPU больше не запускается при загрузке) |
 | режимы HiDPI | `sudo bash gpu/hidpi.sh --undo` |
+| RADV (`/Library/GPUBundles/nvmtl/libvulkan_radeon.dylib`) | сам, если WindowServer не поднялся на новом; иначе `sudo bash ~/gpu/update_radv.sh --undo` и перезагрузка (копии в `/Users/Shared/nullarc-backup/radv-update.*`) |
+| VCN при загрузке | `sudo rm /Users/Shared/gpu/phxboot-vcn` и перезагрузка |
+| плеер (`/Users/Shared/gpu/ffmpeg`, `/usr/local/bin/vplay`, `/Applications/VCN Player.app`) | `sudo bash ~/gpu/install_player.sh --undo` |
 | 120 Гц | `sudo rm /Users/Shared/gpu/phxboot-120` и перезагрузка (или только до перезагрузки: `sudo ~/gpu/phxctl/mesboot hz 60`; WindowServer до перезагрузки продолжит рисовать с темпом 120) |
 
 ## Релизный пакет
 
 `StrixArc-<версия>.zip` (GitHub releases) — папка раунда, которую прогнала машина автора, с бинарниками ровно в том виде,
-в каком их проверяли (PhxBringup, PhxAccel, бинарник NVMTLDriver, RADV, `mesboot`/`phxctl`/`fwplan`), плюс 9 файлов
-прошивок из linux-firmware (без изменений) и лицензии. Бандла NullMoth и его транслятора AIR в нём нет: `setup_metal.sh`
+в каком их проверяли (PhxBringup, PhxAccel, бинарник NVMTLDriver, RADV, `mesboot`/`phxctl`/`fwplan`, FFmpeg/ffplay), плюс
+10 файлов прошивок из linux-firmware (без изменений) и лицензии. Бандла NullMoth и его транслятора AIR в нём нет: `setup_metal.sh`
 берёт их из пакета NullMoth 2.4.1. Порядок установки — в `README.txt`: PhxBringup в OpenCore, `bash install.sh`,
 `sudo bash setup_metal.sh <pkgroot NullMoth> .`, `bash go.sh`, перезагрузка, ещё раз `bash go.sh`.
 
