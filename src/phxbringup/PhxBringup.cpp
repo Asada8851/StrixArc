@@ -49,7 +49,7 @@ static void phxRunAtexit() {
 __attribute__((used, section("__DATA,__mod_term_func,mod_term_funcs"))) static void (*const gPhxTerm)() = phxRunAtexit;
 }
 
-#define PHX_KEXT_BUILD 43u
+#define PHX_KEXT_BUILD 44u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -61,6 +61,10 @@ SYSCTL_INT(_debug, OID_AUTO, phxvcn_sem_miss, CTLFLAG_RD | CTLFLAG_LOCKED, (int 
            "MMHUB TLB flushes done without the ENG17 semaphore");
 SYSCTL_INT(_debug, OID_AUTO, phxvcn_ack_miss, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gVcnAckMiss, 0,
            "MMHUB TLB flushes not acked within 1 ms");
+// build 44: VCN jobs clients put on the ring since boot - a player decoding on VCN makes it grow, without root
+static volatile SInt32 gVcnJobs;
+SYSCTL_INT(_debug, OID_AUTO, phxvcn_jobs, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gVcnJobs, 0,
+           "VCN jobs submitted by clients since boot");
 static int gBosFlush = 0;
 static volatile SInt64 gBosFlushBytes;
 SYSCTL_INT(_debug, OID_AUTO, phxbos_flush, CTLFLAG_RW | CTLFLAG_LOCKED, &gBosFlush, 0,
@@ -527,6 +531,7 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phxvcn_sem_miss);
         sysctl_unregister_oid(&sysctl__debug_phxvcn_ack_miss);
+        sysctl_unregister_oid(&sysctl__debug_phxvcn_jobs);
         sysctl_unregister_oid(&sysctl__debug_phxscanout_verify);
         sysctl_unregister_oid(&sysctl__debug_phxscanout_state);
         sysctl_unregister_oid(&sysctl__debug_phxscanout_copies);
@@ -1265,6 +1270,7 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
     __asm__ __volatile__("mfence" ::: "memory");
     wreg(VCN_UVD_RB_WPTR, static_cast<uint32_t>(q.wptr & (q.ringDw - 1)));
     IOLockUnlock(gpuLock);
+    OSIncrementAtomic(&gVcnJobs);
     *seqOut = seq;
     return kIOReturnSuccess;
 }
@@ -2190,6 +2196,7 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phxvcn_sem_miss);
         sysctl_register_oid(&sysctl__debug_phxvcn_ack_miss);
+        sysctl_register_oid(&sysctl__debug_phxvcn_jobs);
         sysctl_register_oid(&sysctl__debug_phxscanout_verify);
         sysctl_register_oid(&sysctl__debug_phxscanout_state);
         sysctl_register_oid(&sysctl__debug_phxscanout_copies);
