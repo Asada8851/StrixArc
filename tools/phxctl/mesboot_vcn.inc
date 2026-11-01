@@ -275,12 +275,33 @@ static int vcn_release(void)
    return kr ? 6 : 0;
 }
 
+// PhxBringup's "phx-vcn": 1 while it holds the ring (adopted - at boot too, phxboot with $G/phxboot-vcn). Then up,
+// ringtest, mmhub and down would reprogram a ring the kext is feeding: refused until `release`.
+static int vcn_held_by_kext(void)
+{
+   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
+   if (!svc) return 0;
+   int held = 0;
+   CFTypeRef p = IORegistryEntryCreateCFProperty(svc, CFSTR("phx-vcn"), kCFAllocatorDefault, 0);
+   if (p && CFGetTypeID(p) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)p, kCFNumberSInt32Type, &held);
+   if (p) CFRelease(p);
+   IOObjectRelease(svc);
+   return held != 0;
+}
+
 static int vcn_cmd(int argc, char **argv)
 {
    if (chip->id != RDNA3_CHIP_STRIX_POINT) { fprintf(stderr, "mesboot vcn: Strix Point (VCN 4.0.5) only\n"); return 1; }
    vcn_fb_start = (uint64_t)(rd_abs(MMMC_VM_FB_LOCATION_BASE) & 0xffffff) << 24;
    const char *op = argc > 2 ? argv[2] : "status";
-   if (!strcmp(op, "status")) { vcn_status("now"); return 0; }
+   if (!strcmp(op, "status")) { vcn_status("now"); printf("  PhxBringup holds the ring: %s\n", vcn_held_by_kext() ? "yes" : "no"); return 0; }
+   if (vcn_held_by_kext()) {
+      if (!strcmp(op, "adopt")) { printf("vcn: PhxBringup already holds the ring\n"); return 0; }
+      if (strcmp(op, "release")) {
+         fprintf(stderr, "mesboot vcn %s: PhxBringup holds the VCN ring (adopted, at boot or by `adopt`): `mesboot vcn release` first\n", op);
+         return 3;
+      }
+   }
    if (!strcmp(op, "mmhub")) { vcn_mmhub(); vcn_status("after mmhub"); return 0; }
    if (!strcmp(op, "up")) { int r = vcn_up(argc > 3 ? argv[3] : NULL); vcn_status(r ? "up FAILED" : "after up"); return r; }
    if (!strcmp(op, "ringtest")) return vcn_ringtest(argc > 3 ? atoi(argv[3]) : 3);

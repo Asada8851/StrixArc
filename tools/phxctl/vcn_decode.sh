@@ -18,6 +18,8 @@
 #        alone, decode + copy to memory, the CPU decoder (ffmpeg -benchmark); ffplay on VCN (staging copy / per-frame
 #        import) / on the CPU / 10-bit with
 #        4 s of `sample` profile each; per step the MMHUB flushes (buffer mappings) and WindowServer's CPU time
+#      bash gpu/vcn_decode.sh shared                   -> ffplay with the Metal plugin and FFmpeg on one and the same
+#        RADV file (the plugin told by NVMTL_ICD_LIB), as once that RADV is installed (logs: <time>-vcnshared)
 set -u
 [ "$(id -u)" != 0 ] || { echo "run it without sudo (it asks for the password itself)"; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -27,6 +29,8 @@ if [ "${1:-}" = play ]; then
     [ -f "$PLAY" ] || { echo "no file $PLAY"; exit 1; }
 elif [ "${1:-}" = perf ]; then
     MODE=perf
+elif [ "${1:-}" = shared ]; then
+    MODE=shared
 fi
 LOG=~/nullarc_vcn_decode.txt; : > "$LOG"
 LOGS=~/gpu/nullarc_logs.sh; [ -f "$HERE/nullarc_logs.sh" ] && LOGS="$HERE/nullarc_logs.sh"
@@ -61,7 +65,7 @@ finish() {
     sudo -n killall shutdown 2>/dev/null && say "== the armed reboot is cancelled"
     say "== done $(date '+%T')"
     sudo -n dmesg 2>/dev/null | tail -60 > ~/nullarc_vcn_decode_dmesg.txt
-    local tag=vcndec; [ $MODE = play ] && tag=vcnplay; [ $MODE = perf ] && tag=vcnperf
+    local tag=vcndec; [ $MODE = play ] && tag=vcnplay; [ $MODE = perf ] && tag=vcnperf; [ $MODE = shared ] && tag=vcnshared
     bash "$LOGS" $tag "$LOG" ~/nullarc_vcn_decode_dmesg.txt "$T"/*.log | tail -1 | tee -a "$LOG"
     rm -rf "$T"
 }
@@ -88,11 +92,17 @@ sudo bash -c 'nohup shutdown -r +10 >/dev/null 2>&1 &'; say "== reboot armed for
 sync
 
 M vcn status
-UP=1
-M vcn up "$FW" || { say "STOP: vcn up failed"; exit 1; }
-M vcn ringtest 3 || { say "STOP: the ring test failed"; exit 1; }
-M vcn adopt "$FW" || { say "STOP: adopt failed"; exit 1; }
-ADOPTED=1
+# VCN already up and held by PhxBringup (phxboot with $G/phxboot-vcn): used as it is, and left so at the end
+if ioreg -rc PhxBringup -d1 | grep -q '"phx-vcn" = 1'; then
+    say "== VCN is up since boot and held by PhxBringup: used as it is, left up at the end"
+else
+    UP=1
+    M vcn up "$FW" || { say "STOP: vcn up failed"; exit 1; }
+    M vcn ringtest 3 || { say "STOP: the ring test failed"; exit 1; }
+    M vcn adopt "$FW" || { say "STOP: adopt failed"; exit 1; }
+    ADOPTED=1
+fi
+say "VCN jobs so far: $(sysctl -n debug.phxvcn_jobs 2>/dev/null || echo '? (PhxBringup before 44)')"
 
 # ffplay with a time limit and the CPU time of the whole run; its log (-v verbose) goes to $T/ffplay-<tag>.log, one
 # summary line to the round's log: texture format (NV12: frames from VCN), the last status line's dropped frames
@@ -113,6 +123,21 @@ PLAY() {
     hung $rc "ffplay $tag" && return 1
     return 0
 }
+
+if [ $MODE = shared ]; then
+    # one RADV image for both Vulkan users in the process: the plugin's (SDL's Metal renderer) and FFmpeg's (vkshim)
+    say "== shared: the Metal plugin and FFmpeg in ffplay on the same RADV file ($T/libvulkan_radeon.dylib)"
+    cp "$VID/hevc_2160.mp4" "$T/hevc_2160.mp4" || { say "STOP: no $VID/hevc_2160.mp4"; exit 1; }
+    VENV="$VENV NVMTL_ICD_LIB=$T/libvulkan_radeon.dylib NVMTL_LOG=1 NVMTL_LOG_PATH=$T/plugin-shared.log"
+    PLAY shared-hevc $VCNPLAY "$T/hevc_2160.mp4" || exit 1
+    opened=$(grep -m1 -o 'driver opened directly: [^ ]*' "$T/plugin-shared.log" 2>/dev/null | sed 's/.*: //')
+    ff=$(grep -m1 -o 'vkshim: Vulkan from .*' "$T/ffplay-shared-hevc.log" | sed 's/vkshim: Vulkan from //')
+    say "   the plugin opened ${opened:-? (no plugin log)}, FFmpeg's vkshim ${ff:-?}"
+    # dyld reports /tmp as /private/tmp (vkshim's dladdr), the plugin its environment's string
+    [ -n "$opened" ] && [ "${opened#/private}" = "${ff#/private}" ] && say "   one RADV file for both: as after the install" || say "   !! not the same file: this run does not show the installed case"
+    [ -f "$VID/user_av.mp4" ] && { PLAY shared-user_av $VCNPLAY -t 20 "$VID/user_av.mp4" || exit 1; }
+    exit 0
+fi
 
 if [ $MODE = perf ]; then
     say "== perf: hevc_2160 (4K HEVC, 300 frames) and hevc10_2160, VCN against the CPU"

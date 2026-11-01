@@ -42,6 +42,22 @@ MIT, Copyright The Mesa 3D Graphics Library contributors (https://docs.mesa3d.or
 https://gitlab.freedesktop.org/mesa/mesa). A few Mesa source files carry other permissive licenses, as listed on
 that page.
 
+## FFmpeg — `gpu/ffmpeg/` in the release package (ffmpeg, ffprobe, ffplay, lib*.dylib), `ffmpeg-patches`
+
+GNU Lesser General Public License 2.1 or later — [`LICENSES/LGPL-2.1-or-later.txt`](LICENSES/LGPL-2.1-or-later.txt).
+Copyright the FFmpeg developers (https://ffmpeg.org/legal.html). FFmpeg 8.1.2 as released
+(https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, checked against its signature), built without GPL or nonfree parts
+as shared libraries by [`tools/cross/build-ffmpeg.sh`](tools/cross/build-ffmpeg.sh), with
+[`ffmpeg-patches`](ffmpeg-patches) applied to ffplay. That script, the patches and the release tarball are the
+complete corresponding source.
+
+## SDL2 — linked into `gpu/ffmpeg/bin/ffplay`, `sdl-patches`
+
+zlib license — [`LICENSES/Zlib-SDL2.txt`](LICENSES/Zlib-SDL2.txt). Copyright (C) 1997-2025 Sam Lantinga. SDL 2.32.10
+as released (https://github.com/libsdl-org/SDL/releases/tag/release-2.32.10, checked against its signature), built by
+[`tools/cross/build-sdl2.sh`](tools/cross/build-sdl2.sh) with [`sdl-patches`](sdl-patches) applied (altered from the
+original: the Metal renderer's texture updates).
+
 ## Cobalt64 (Navi48-MacOS) — RADV Darwin backend, `src/phxbringup/PhxNativeABI.h` layouts
 
 MIT License, Copyright (c) 2026 Navi48-MacOS contributors. The user-client ABI layouts and the RADV Darwin winsys
@@ -52,7 +68,7 @@ follow Cobalt64.
 MIT-style license, Copyright 2021–2022 Advanced Micro Devices, Inc.; the notice is at the top of each file.
 PhxBringup's bring-up sequences were written after the Linux amdgpu driver (MIT parts) and a register trace of it.
 
-## AMD GPU microcode — `fw/*.bin` in the release package
+## AMD GPU microcode — `fw/*.bin` in the release package (vcn_4_0_5.bin from 0.2.5)
 
 From linux-firmware (https://gitlab.com/kernel-firmware/linux-firmware, `amdgpu/`), unmodified.
 [`LICENSES/LICENSE.amdgpu.txt`](LICENSES/LICENSE.amdgpu.txt): Copyright (C) Advanced Micro Devices, Inc.;
